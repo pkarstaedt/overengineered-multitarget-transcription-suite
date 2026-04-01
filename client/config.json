@@ -1,0 +1,54 @@
+{
+  "server_url": "http://127.0.0.1:8001/transcribe",
+  "hotkey": ">+strg+umschalt",
+  "fast_hotkey": "linke windows+strg",
+  "undo_hotkey": "alt+>+strg+umschalt",
+  "microphone_index": 26,
+  "language": "en",
+  "sample_rate": 16000,
+  "pre_type_delay": 0.05,
+  "char_delay": 0.0,
+  "debug": false,
+  "input_classes": [
+    "CASCADIA_HOSTING_WINDOW_CLASS",
+    "Chrome_RenderWidgetHostHWND",
+    "Chrome_WidgetWin_1",
+    "ConsoleWindowClass",
+    "Edit",
+    "MozillaContentWindowClass",
+    "MozillaWindowClass",
+    "RICHEDIT60W",
+    "RichEdit",
+    "RichEdit20A",
+    "RichEdit20W",
+    "RichEdit50W",
+    "Scintilla",
+    "TListBox",
+    "WebViewWnd"
+  ],
+  "type_input_classes": [
+    "CASCADIA_HOSTING_WINDOW_CLASS",
+    "ConsoleWindowClass"
+  ],
+  "right_click_paste_input_classes": [
+    "TListBox"
+  ],
+  "vad_silence_rms": 502.0,
+  "vad_silence_secs": 2.0,
+  "vad_min_speech_s": 1.5,
+  "vad_hangover_s": 1.0,
+  "vad_max_chunk_s": 90.0,
+  "erase_delay": 0.08,
+  "live_mode": false,
+  "simple_mode": true,
+  "main_live_mode": false,
+  "main_simple_mode": true,
+  "fast_live_mode": false,
+  "fast_simple_mode": false,
+  "simple_mode_input_classes": [
+    "CASCADIA_HOSTING_WINDOW_CLASS",
+    "ConsoleWindowClass",
+    "TListBox"
+  ],
+  "live_mode_input_classes": []
+}

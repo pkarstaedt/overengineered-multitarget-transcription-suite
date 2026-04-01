@@ -1,0 +1,14 @@
+# --- PyTorch with CUDA (install BEFORE nemo_toolkit) ---
+# Run this first manually so you can pick the right CUDA version:
+#
+#   pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121
+#
+# Then install the rest:
+
+fastapi>=0.111
+uvicorn[standard]>=0.29
+python-multipart>=0.0.9
+soundfile>=0.12
+numpy>=1.24
+scipy>=1.13
+nemo_toolkit[asr]>=2.0

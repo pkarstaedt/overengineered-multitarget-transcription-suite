@@ -1,0 +1,11 @@
+server/.venv/
+client/dist/
+client/build/
+client/.venv/
+client/native_hotkey_helper/bin/
+client/native_hotkey_helper/obj/
+.claude/
+__pycache__/
+*.pyc
+/client/failed_audio
+client/history.json
