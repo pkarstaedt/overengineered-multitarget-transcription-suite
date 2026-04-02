@@ -1299,6 +1299,13 @@ def run_session(config: dict, insert_mode: str = "type", profile: str = "main", 
         # ════════════════════════════════════════════════════════════════════
         if not live:
             time.sleep(config.get("pre_type_delay", 0.05))
+            if inline_status:
+                # The listening animation starts while the hotkey is still held.
+                # Give Windows and the target app a brief chance to clear any
+                # logically depressed modifiers before we start replace-in-place
+                # backspace updates.
+                _release_possible_modifiers()
+                time.sleep(0.03)
             if overlay_status:
                 _ensure_overlay()
                 _set_overlay(overlay_recording)
