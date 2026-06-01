@@ -4,7 +4,7 @@ A Windows push-to-talk voice transcription client. Hold an overengineered array 
 
 The project is intentionally asymmetric:
 
-- The transcription boundary is kept simple. The client sends audio to a small `/transcribe` HTTP API and expects a small JSON response back. This makes it easy to swap in different backends such as faster-whisper, a local Parakeet server, or a future in-process ONNX backend.
+- The transcription boundary is kept simple. The client can either send audio to a small `/transcribe` HTTP API or use OpenAI speech-to-text directly. This makes it easy to swap in different backends such as faster-whisper, a local Parakeet server, OpenAI transcription, or a future in-process ONNX backend.
 - The output side is intentionally more complex. Different Windows targets accept text in very different ways: some need slow typed input, some are happy with `Ctrl+V`, some console-like targets prefer right-click paste, and some remote-agent / coding-console workflows break unless the app is very conservative.
 
 That complexity is deliberate. One of the main goals of this client is to work not only in normal local GUI applications, but also in terminals, console-based tools, remote coding agents, SSH/RDP sessions, and other places where many commercial dictation products still fail. The result is a richer insertion-mode matrix on the client side, paired with a very small and replaceable transcription-server contract.
@@ -152,6 +152,13 @@ Run (must be Administrator):
 .venv\Scripts\python overmultiasrsuite.py
 ```
 
+If you want to use LLM post-editing, set the OpenAI key through the environment instead of `config.json`:
+
+```powershell
+$env:OPENAI_API_KEY = "<your-openai-api-key>"
+.venv\Scripts\python .\overmultiasrsuite.py
+```
+
 ### Distribute as a standalone exe
 
 ```bat
@@ -159,7 +166,7 @@ cd client
 build.bat
 ```
 
-Produces `client/dist/OverMultiASRSuite.exe` plus a native hotkey sidecar. Distribute alongside `config.json`:
+Produces `client/dist/OverMultiASRSuite.exe` plus a native hotkey sidecar. Distribute alongside your local `config.json` if you want to preserve settings between machines:
 
 ```
 OverMultiASRSuite.exe
@@ -175,13 +182,104 @@ The exe embeds a UAC manifest so Windows will prompt for elevation on launch —
 
 ## Configuration
 
-Edit `config.json` next to the exe, or use the Settings dialog (right-click tray icon → **Settings…**).
+Edit `config.json` next to the exe, or use the Settings dialog (right-click tray icon → **Settings…**). The repository includes `client/config.json.example`; copy it to `client/config.json` for a starting point, or let the app create `config.json` on first run.
+
+### OpenAI API key
+
+The optional post-edit LLM path reads its API key from the `OPENAI_API_KEY` environment variable. The key is intentionally not stored in `config.json`.
+
+PowerShell examples:
+
+```powershell
+$env:OPENAI_API_KEY = "<your-openai-api-key>"
+.venv\Scripts\python .\overmultiasrsuite.py
+```
+
+```powershell
+$env:OPENAI_API_KEY = "<your-openai-api-key>"
+.\OverMultiASRSuite.exe
+```
+
+Post-edit prompt bodies are stored in profile-specific Markdown files next to the app:
+
+The app has three post-edit profiles:
+
+| Profile | Prompt file | Intended use |
+|---|---|---|
+| `dev` | `dev_post_edit_prompt.md` | Technical dictation, coding-agent prompts, implementation notes, debugging, reviews, and architecture work. |
+| `pro` | `pro_post_edit_prompt.md` | Professional writing such as messages, emails, documentation notes, and polished workplace text. |
+| `personal` | `personal_post_edit_prompt.md` | Casual personal notes and messages where the speaker's natural voice should be preserved. |
+
+During dictation, the post-edit toggle key cycles the current session through:
+
+```text
+off -> dev -> pro -> personal -> off
+```
+
+The active profile controls which Markdown prompt file is loaded for the OpenAI post-edit pass. In preview mode, a non-edited draft can also be sent through the default `dev` post-edit profile from the pending preview gesture.
+
+```text
+client/dev_post_edit_prompt.md
+client/pro_post_edit_prompt.md
+client/personal_post_edit_prompt.md
+```
+
+Each file contains three editable sections:
+
+```md
+# Post-Edit Prompt
+
+## System
+...
+
+## Developer
+...
+
+## User
+...
+```
+
+The Settings dialog still lets you edit these fields, but saving writes them back to Markdown files instead of storing large escaped multiline strings in `config.json`. The repository keeps `.example` versions only; your real profile prompts are ignored by git.
+
+You can also provide durable product / repo / coding-agent context through a second Markdown file:
+
+```text
+client/post_edit_context.md
+```
+
+Its contents are available to the user prompt through:
+
+- `{project_context}`
+- `{agent_guidance}`
+
+This is the best place to put:
+
+- what you are building
+- repo-level guardrails
+- terminology corrections
+- coding-agent prompting preferences
+
+The optional OpenAI transcription backend has its own separate Markdown prompt file:
+
+```text
+client/transcription_prompt.md
+```
+
+That prompt is intentionally separate from the post-edit prompt. It should stay focused on transcription cleanup:
+
+- reduce filler words and repetitions
+- preserve technical vocabulary and identifiers
+- improve punctuation and readability
+
+while the post-edit prompt can stay focused on stronger restructuring and coding-agent prompt polish. The actual context and prompt files are local-only; use the `*.example` files as public templates.
 
 ### Core settings
 
 | Key | Default | Description |
 |---|---|---|
 | `server_url` | `http://…/transcribe` | Transcription server endpoint |
+| `transcription_backend` | `http` | `http` uses the configured `/transcribe` endpoint. `openai` sends WAV audio directly to OpenAI speech-to-text. |
+| `openai_transcription_model` | `gpt-4o-mini-transcribe` | OpenAI speech-to-text model used when `transcription_backend` is `openai`. |
 | `hotkey` | `ctrl+shift+space` | Main push-to-talk hotkey. Hold to record, release to transcribe. Insertion is chosen automatically: console-like fields use typed input, normal editors use fast paste. |
 | `fast_hotkey` | `""` | Optional push-to-talk override that always uses fast paste / dump. Empty = disabled. |
 | `undo_hotkey` | `""` | Optional hotkey to re-insert the last successful transcription into the current target using the current insertion logic. Empty = disabled. |
@@ -245,7 +343,7 @@ Right-click the tray icon for the context menu:
 
 ## Settings dialog
 
-Right-click the tray icon and choose **Settings…**. The window has three tabs at the top and a persistent history panel below them. Click **Save** to write all changes to `config.json`; closing with × discards unsaved changes.
+Right-click the tray icon and choose **Settings...**. The window has tabs for core settings, LLM/post-edit settings, microphone testing, and input-class routing, plus a persistent history panel below them. Click **Save** to write changes to `config.json` and the prompt Markdown files; closing with X discards unsaved changes.
 
 ### Settings tab
 
@@ -258,6 +356,17 @@ Right-click the tray icon and choose **Settings…**. The window has three tabs 
 - **Voice Activity Detection** — inline group showing all five VAD parameters with descriptions; changes take effect on the next recording after saving.
 - **Live transcription mode** — when checked, each sentence is streamed to the field as it arrives and status is shown via a cursor-side overlay dot instead of characters in the field. When unchecked (default), all chunks are collected and typed at once.
 - **Simple mode** — classic mode only; greyed out when live mode is on. When checked (default), the status indicators are plain `®` (listening) and `¿` (transcribing) — a single character each, reliable over SSH and RDP. When unchecked, animated block-shade and corner-spin characters are used instead.
+
+### LLM tab
+
+- **API key env** - shows whether `OPENAI_API_KEY` is set. The key is never saved to `config.json`.
+- **Post-edit model** - OpenAI model used for post-editing completed transcripts.
+- **Reasoning effort** - reasoning setting passed to the OpenAI Responses API for post-editing.
+- **Transcription backend** - choose local/HTTP transcription or OpenAI speech-to-text.
+- **Transcription model and prompt** - settings for the OpenAI transcription backend and its local `transcription_prompt.md` file.
+- **Toggle key** - key pressed during dictation to cycle post-edit profiles: `off -> dev -> pro -> personal -> off`.
+- **Profile prompts** - shows the resolved paths for the three local profile prompt files.
+- **System / Developer / User prompt editors** - edit and save prompt sections as Markdown instead of embedding long strings in `config.json`.
 
 ### Microphone Test tab
 
@@ -495,7 +604,14 @@ client/
   build.bat             One-click build script
   install.bat           First-time venv setup
   requirements.txt      Python dependencies
-  config.json           Runtime configuration (edit directly or via Settings dialog)
+  config.json.example   Public configuration template
+  config.json           Runtime configuration (auto-created/local-only)
+  *_post_edit_prompt.md.example Public prompt templates
+  *_post_edit_prompt.md Local profile prompts (auto-created/local-only)
+  transcription_prompt.md.example Public transcription prompt template
+  transcription_prompt.md Local transcription prompt (auto-created/local-only)
+  post_edit_context.md.example Public context template
+  post_edit_context.md  Local project context (auto-created/local-only)
   history.json          Transcription history (auto-created)
   overmultiasrsuite.log    Log file when running as exe (auto-created)
   failed_audio/         WAV recordings of failed transcriptions, for retry (auto-created)

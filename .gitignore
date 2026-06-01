@@ -1,6 +1,7 @@
 server/.venv/
 client/dist/
 client/build/
+client/config.json
 client/.venv/
 client/native_hotkey_helper/bin/
 client/native_hotkey_helper/obj/
@@ -9,3 +10,13 @@ __pycache__/
 *.pyc
 /client/failed_audio
 client/history.json
+client/overmultiasrsuite.log
+client/post_edit_context.md
+client/post_edit_prompt.md
+client/transcription_prompt.md
+client/*_post_edit_prompt.md
+.env
+.env.*
+*.log
+launch.bat
+launch.ps1

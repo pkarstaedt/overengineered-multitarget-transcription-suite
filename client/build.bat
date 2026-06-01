@@ -24,8 +24,15 @@ if errorlevel 1 (echo Build failed. & pause & exit /b 1)
 echo.
 echo [4/4] Copying runtime files...
 if not exist "dist\config.json" (
-    copy config.json "dist\config.json" >nul
-    echo Copied config.json to dist\
+    if exist "config.json" (
+        copy config.json "dist\config.json" >nul
+        echo Copied local config.json to dist\
+    ) else if exist "config.json.example" (
+        copy config.json.example "dist\config.json" >nul
+        echo Copied config.json.example to dist\config.json
+    ) else (
+        echo No config template found; the app will create config.json on first run.
+    )
 ) else (
     echo config.json already exists in dist\ - not overwriting.
 )
@@ -38,7 +45,7 @@ echo Build complete!
 echo Distribute these two files:
 echo   dist\OverMultiASRSuite.exe
 echo   dist\HotkeyHelper.exe
-echo   dist\config.json
+echo   dist\config.json ^(optional starter/local settings^)
 echo.
 echo NOTE: The exe requests UAC elevation on launch (needed for global hotkeys).
 echo       history.json and overmultiasrsuite.log are created next to the exe on first run.

@@ -6,10 +6,12 @@ Hold the hotkey -> records audio -> sends to transcription server -> inserts res
 
 import collections
 import ctypes
+import ctypes.wintypes
 import datetime
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -46,6 +48,14 @@ if getattr(sys, "frozen", False):
     _log = open(_app_dir() / "overmultiasrsuite.log", "a", encoding="utf-8", buffering=1)
     sys.stdout = _log
     sys.stderr = _log
+else:
+    for _stream_name in ("stdout", "stderr"):
+        _stream = getattr(sys, _stream_name, None)
+        if _stream is not None and hasattr(_stream, "reconfigure"):
+            try:
+                _stream.reconfigure(errors="backslashreplace")
+            except Exception:
+                pass
 
 
 def _safe_console_text(value) -> str:
@@ -61,9 +71,22 @@ def _safe_console_text(value) -> str:
 # ── Config ───────────────────────────────────────────────────────────────────
 
 CONFIG_FILE = _app_dir() / "config.json"
+DEFAULT_PROMPT_FILE = "post_edit_prompt.md"
+DEFAULT_CONTEXT_FILE = "post_edit_context.md"
+DEFAULT_TRANSCRIPTION_PROMPT_FILE = "transcription_prompt.md"
+POST_EDIT_PROFILES = ("dev", "pro", "personal")
 
 DEFAULT_CONFIG = {
-    "server_url": "http://192.168.1.227:8001/transcribe",
+    "transcription_backend": "http",
+    "server_url": "http://127.0.0.1:8001/transcribe",
+    "openai_transcription_model": "gpt-4o-mini-transcribe",
+    "openai_transcription_prompt_markdown_file": DEFAULT_TRANSCRIPTION_PROMPT_FILE,
+    "openai_transcription_prompt": (
+        "Transcribe the spoken audio into clean text. Return only transcript text. Do not echo this prompt. "
+        "Do not use ellipses as continuation markers and do not end the transcript with `...`. "
+        "Remove obvious filler words when doing so does not change meaning. Preserve technical vocabulary, "
+        "product names, file names, identifiers, and code-like terms exactly when possible."
+    ),
     "hotkey": "ctrl+shift+space",
     "fast_hotkey": "",
     "undo_hotkey": "",          # empty = disabled
@@ -72,11 +95,38 @@ DEFAULT_CONFIG = {
     "sample_rate": 16000,
     "pre_type_delay": 0.05,
     "char_delay": 0.0,
+    "duck_audio_during_dictation": False,
+    "duck_audio_level_percent": 25,
     "erase_delay":  0.08,  # pause after erasing status before typing result (helps SSH/terminals)
     "main_live_mode": False,
     "main_simple_mode": True,
+    "main_mode": "preview",
+    "main_post_edit_mode": False,
     "fast_live_mode": False,
     "fast_simple_mode": True,
+    "fast_mode": "preview",
+    "fast_post_edit_mode": False,
+    "openai_model": "gpt-5-mini",
+    "openai_reasoning_effort": "low",
+    "openai_prompt_markdown_file": DEFAULT_PROMPT_FILE,
+    "openai_context_markdown_file": DEFAULT_CONTEXT_FILE,
+    "editor_notes_overlay_seconds": 4.0,
+    "editor_notes_chars_per_extra_second": 45.0,
+    "post_edit_toggle_key": "y",
+    "main_review_non_post_edit_sessions": False,
+    "fast_review_non_post_edit_sessions": False,
+    "preview_max_width": 860,
+    "preview_max_height": 1000,
+    "openai_system_prompt": (
+        "You are a careful transcript post-editor. Return only valid JSON matching the requested schema. "
+        "Do not invent facts."
+    ),
+    "openai_developer_prompt": (
+        "Clean up the transcript for use as a coding-agent or technical prompt. Remove filler words such as "
+        "um, uh, like, and you know when they are not meaningful. Preserve intent, preserve technical details, "
+        "fix obvious grammar, and do not add new facts or requirements."
+    ),
+    "openai_user_prompt_template": "Transcript:\n{transcript}",
     "live_mode":   False,  # True = stream chunks live as they arrive (uses screen overlay); False = classic (collect all, type at end)
     "simple_mode": True,   # True = simple ® / ¿ indicators (SSH/terminal safe); False = fancy block-shade/corner-spin animations  (classic mode only)
     "vad_silence_rms":  400,   # RMS below this = silence. Hangover handles noise, so keep this low.
@@ -110,15 +160,48 @@ def load_config() -> dict:
             cfg = json.load(f)
         for k, v in DEFAULT_CONFIG.items():
             cfg.setdefault(k, v)
+        legacy_prompt = cfg.get("openai_post_edit_prompt")
+        if legacy_prompt:
+            cfg.setdefault("openai_user_prompt_template", legacy_prompt)
+        cfg.pop("openai_api_key", None)
         cfg.setdefault("main_live_mode", cfg.get("live_mode", DEFAULT_CONFIG["main_live_mode"]))
         cfg.setdefault("main_simple_mode", cfg.get("simple_mode", DEFAULT_CONFIG["main_simple_mode"]))
         cfg.setdefault("fast_live_mode", cfg.get("live_mode", DEFAULT_CONFIG["fast_live_mode"]))
         cfg.setdefault("fast_simple_mode", cfg.get("simple_mode", DEFAULT_CONFIG["fast_simple_mode"]))
+        if "main_mode" not in cfg:
+            cfg["main_mode"] = "live" if cfg.get("main_live_mode", False) else "classic" if cfg.get("main_simple_mode", True) else "preview"
+        if "fast_mode" not in cfg:
+            cfg["fast_mode"] = "live" if cfg.get("fast_live_mode", False) else "classic" if cfg.get("fast_simple_mode", True) else "preview"
+        legacy_review = bool(cfg.get("review_non_post_edit_sessions", False))
+        cfg.setdefault("main_review_non_post_edit_sessions", legacy_review)
+        cfg.setdefault("fast_review_non_post_edit_sessions", legacy_review)
+        cfg.pop("review_non_post_edit_sessions", None)
+        prompt_sections = _load_prompt_markdown(cfg)
+        cfg["openai_transcription_prompt"] = _load_transcription_prompt_markdown(cfg)
+        cfg["openai_system_prompt"] = prompt_sections["system"]
+        cfg["openai_developer_prompt"] = prompt_sections["developer"]
+        cfg["openai_user_prompt_template"] = prompt_sections["user"]
         return cfg
-    return DEFAULT_CONFIG.copy()
+    cfg = DEFAULT_CONFIG.copy()
+    prompt_sections = _load_prompt_markdown(cfg)
+    cfg["openai_transcription_prompt"] = _load_transcription_prompt_markdown(cfg)
+    cfg["openai_system_prompt"] = prompt_sections["system"]
+    cfg["openai_developer_prompt"] = prompt_sections["developer"]
+    cfg["openai_user_prompt_template"] = prompt_sections["user"]
+    return cfg
 
 
 def save_config(cfg: dict):
+    cfg = dict(cfg)
+    _save_prompt_markdown(cfg)
+    _save_transcription_prompt_markdown(cfg)
+    cfg.pop("openai_api_key", None)
+    cfg.pop("review_non_post_edit_sessions", None)
+    cfg.pop("openai_transcription_prompt", None)
+    cfg.pop("openai_system_prompt", None)
+    cfg.pop("openai_developer_prompt", None)
+    cfg.pop("openai_user_prompt_template", None)
+    cfg.pop("openai_post_edit_prompt", None)
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
 
@@ -127,6 +210,26 @@ def save_config(cfg: dict):
 
 _HISTORY_FILE = _app_dir() / "history.json"
 _history: collections.deque = collections.deque(maxlen=20)
+_last_result_text = [""]
+
+
+def _set_last_result_text(text: str | None):
+    _last_result_text[0] = (text or "").strip()
+
+
+def _latest_history_text() -> str:
+    return next(
+        ((e.get("text") or "").strip() for e in reversed(list(_history)) if (e.get("text") or "").strip()),
+        "",
+    )
+
+
+def _history_text_is_meaningful(text: str | None) -> bool:
+    stripped = (text or "").strip()
+    if not stripped:
+        return False
+    words = re.findall(r"\b[\w']+\b", stripped, flags=re.UNICODE)
+    return len(words) >= 2
 
 
 def _load_history():
@@ -134,6 +237,7 @@ def _load_history():
         try:
             items = json.loads(_HISTORY_FILE.read_text(encoding="utf-8"))
             _history.extend(items)
+            _set_last_result_text(_latest_history_text())
         except Exception:
             pass
 
@@ -147,8 +251,173 @@ def _save_history():
 
 def _add_to_history(entry: dict):
     """Append a history entry dict and persist. Callers build the dict."""
+    text = entry.get("text")
+    if text and not _history_text_is_meaningful(text):
+        print(f"[HISTORY] Skipping short transcription: {text!r}", flush=True)
+        return
     _history.append(entry)
     _save_history()
+
+
+def _openai_api_key() -> str:
+    return (os.environ.get("OPENAI_API_KEY") or "").strip()
+
+
+def _post_edit_profile_name(value) -> str:
+    profile = str(value or "").strip().lower()
+    return profile if profile in POST_EDIT_PROFILES else ""
+
+
+def _next_post_edit_profile(current) -> str:
+    profile = _post_edit_profile_name(current)
+    if not profile:
+        return POST_EDIT_PROFILES[0]
+    idx = POST_EDIT_PROFILES.index(profile)
+    return POST_EDIT_PROFILES[idx + 1] if idx + 1 < len(POST_EDIT_PROFILES) else ""
+
+
+def _post_edit_prompt_file(profile: str) -> str:
+    profile = _post_edit_profile_name(profile) or POST_EDIT_PROFILES[0]
+    return f"{profile}_post_edit_prompt.md"
+
+
+def _prompt_markdown_path(cfg: dict | None = None, profile: str = "dev") -> Path:
+    key = f"openai_{_post_edit_profile_name(profile) or 'dev'}_prompt_markdown_file"
+    name = (cfg or {}).get(key) or _post_edit_prompt_file(profile)
+    path = Path(name)
+    if not path.is_absolute():
+        path = _app_dir() / path
+    return path
+
+
+def _context_markdown_path(cfg: dict | None = None) -> Path:
+    name = (cfg or {}).get("openai_context_markdown_file", DEFAULT_CONTEXT_FILE)
+    path = Path(name)
+    if not path.is_absolute():
+        path = _app_dir() / path
+    return path
+
+
+def _transcription_prompt_markdown_path(cfg: dict | None = None) -> Path:
+    name = (cfg or {}).get("openai_transcription_prompt_markdown_file", DEFAULT_TRANSCRIPTION_PROMPT_FILE)
+    path = Path(name)
+    if not path.is_absolute():
+        path = _app_dir() / path
+    return path
+
+
+def _prompt_sections_from_config(cfg: dict) -> dict[str, str]:
+    return {
+        "system": cfg.get("openai_system_prompt", DEFAULT_CONFIG["openai_system_prompt"]),
+        "developer": cfg.get("openai_developer_prompt", DEFAULT_CONFIG["openai_developer_prompt"]),
+        "user": cfg.get("openai_user_prompt_template", DEFAULT_CONFIG["openai_user_prompt_template"]),
+    }
+
+
+def _render_prompt_markdown(sections: dict[str, str]) -> str:
+    ordered = [
+        ("System", sections.get("system", "").strip()),
+        ("Developer", sections.get("developer", "").strip()),
+        ("User", sections.get("user", "").strip()),
+    ]
+    parts = ["# Post-Edit Prompt"]
+    for title, body in ordered:
+        parts.append(f"## {title}")
+        parts.append(body)
+    return "\n\n".join(parts).strip() + "\n"
+
+
+def _parse_prompt_markdown(text: str) -> dict[str, str]:
+    sections = {"system": "", "developer": "", "user": ""}
+    current_key = None
+    current_lines: list[str] = []
+
+    def _flush():
+        nonlocal current_key, current_lines
+        if current_key is not None:
+            sections[current_key] = "\n".join(current_lines).strip()
+        current_lines = []
+
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("## "):
+            _flush()
+            header = stripped[3:].strip().lower()
+            if header in sections:
+                current_key = header
+            else:
+                current_key = None
+        elif current_key is not None:
+            current_lines.append(line)
+    _flush()
+    return sections
+
+
+def _load_prompt_markdown(cfg: dict, profile: str = "dev") -> dict[str, str]:
+    path = _prompt_markdown_path(cfg, profile)
+    if not path.exists() and _post_edit_profile_name(profile) == "dev":
+        legacy_path = _app_dir() / DEFAULT_PROMPT_FILE
+        if legacy_path.exists():
+            path = legacy_path
+    if path.exists():
+        try:
+            parsed = _parse_prompt_markdown(path.read_text(encoding="utf-8"))
+            return {
+                "system": parsed.get("system") or cfg.get("openai_system_prompt", DEFAULT_CONFIG["openai_system_prompt"]),
+                "developer": parsed.get("developer") or cfg.get("openai_developer_prompt", DEFAULT_CONFIG["openai_developer_prompt"]),
+                "user": parsed.get("user") or cfg.get("openai_user_prompt_template", DEFAULT_CONFIG["openai_user_prompt_template"]),
+            }
+        except Exception:
+            pass
+    sections = _prompt_sections_from_config(cfg)
+    try:
+        path.write_text(_render_prompt_markdown(sections), encoding="utf-8")
+    except Exception:
+        pass
+    return sections
+
+
+def _save_prompt_markdown(cfg: dict, profile: str = "dev"):
+    path = _prompt_markdown_path(cfg, profile)
+    path.write_text(_render_prompt_markdown(_prompt_sections_from_config(cfg)), encoding="utf-8")
+
+
+def _load_context_markdown(cfg: dict) -> str:
+    path = _context_markdown_path(cfg)
+    if path.exists():
+        try:
+            return path.read_text(encoding="utf-8").strip()
+        except Exception:
+            return ""
+    try:
+        path.write_text("", encoding="utf-8")
+    except Exception:
+        pass
+    return ""
+
+
+def _load_transcription_prompt_markdown(cfg: dict) -> str:
+    path = _transcription_prompt_markdown_path(cfg)
+    if path.exists():
+        try:
+            return path.read_text(encoding="utf-8").strip()
+        except Exception:
+            pass
+    default_prompt = (cfg.get("openai_transcription_prompt") or DEFAULT_CONFIG["openai_transcription_prompt"]).strip()
+    try:
+        path.write_text(default_prompt + "\n", encoding="utf-8")
+    except Exception:
+        pass
+    return default_prompt
+
+
+def _save_transcription_prompt_markdown(cfg: dict):
+    path = _transcription_prompt_markdown_path(cfg)
+    prompt_text = (cfg.get("openai_transcription_prompt") or DEFAULT_CONFIG["openai_transcription_prompt"]).strip()
+    try:
+        path.write_text(prompt_text + "\n", encoding="utf-8")
+    except Exception:
+        pass
 
 
 def _helper_project_dir() -> Path:
@@ -411,6 +680,135 @@ _user32.GetClipboardData.restype = ctypes.wintypes.HANDLE
 _user32.SetClipboardData.argtypes = (ctypes.c_uint, ctypes.wintypes.HANDLE)
 _user32.SetClipboardData.restype = ctypes.wintypes.HANDLE
 
+_ole32 = ctypes.windll.ole32
+_ole32.CoCreateInstance.argtypes = (
+    ctypes.c_void_p,
+    ctypes.c_void_p,
+    ctypes.wintypes.DWORD,
+    ctypes.c_void_p,
+    ctypes.POINTER(ctypes.c_void_p),
+)
+_ole32.CoCreateInstance.restype = ctypes.c_long
+_ole32.CoInitializeEx.argtypes = (ctypes.c_void_p, ctypes.wintypes.DWORD)
+_ole32.CoInitializeEx.restype = ctypes.c_long
+_ole32.CoUninitialize.argtypes = ()
+_ole32.CoUninitialize.restype = None
+
+COINIT_APARTMENTTHREADED = 0x2
+CLSCTX_INPROC_SERVER = 0x1
+S_OK = 0
+S_FALSE = 1
+
+
+class _GUID(ctypes.Structure):
+    _fields_ = [
+        ("Data1", ctypes.c_ulong),
+        ("Data2", ctypes.c_ushort),
+        ("Data3", ctypes.c_ushort),
+        ("Data4", ctypes.c_ubyte * 8),
+    ]
+
+    def __init__(self, value: str):
+        super().__init__()
+        import uuid
+
+        u = uuid.UUID(value)
+        self.Data1, self.Data2, self.Data3, rest = u.fields[0], u.fields[1], u.fields[2], u.bytes[8:]
+        for i, b in enumerate(rest):
+            self.Data4[i] = b
+
+
+class _PROPVARIANT_UNION(ctypes.Union):
+    _fields_ = [
+        ("llVal", ctypes.c_longlong),
+        ("lVal", ctypes.c_long),
+        ("ulVal", ctypes.c_ulong),
+        ("punkVal", ctypes.c_void_p),
+        ("pwszVal", ctypes.c_wchar_p),
+    ]
+
+
+class _PROPVARIANT(ctypes.Structure):
+    _anonymous_ = ("u",)
+    _fields_ = [
+        ("vt", ctypes.c_ushort),
+        ("wReserved1", ctypes.c_ubyte),
+        ("wReserved2", ctypes.c_ubyte),
+        ("wReserved3", ctypes.c_ulong),
+        ("u", _PROPVARIANT_UNION),
+    ]
+
+
+class _IUnknownVTable(ctypes.Structure):
+    _fields_ = [
+        ("QueryInterface", ctypes.c_void_p),
+        ("AddRef", ctypes.c_void_p),
+        ("Release", ctypes.c_void_p),
+    ]
+
+
+class _IUnknown(ctypes.Structure):
+    _fields_ = [("lpVtbl", ctypes.POINTER(_IUnknownVTable))]
+
+
+class _IMMDeviceEnumeratorVTable(ctypes.Structure):
+    _fields_ = [
+        ("QueryInterface", ctypes.c_void_p),
+        ("AddRef", ctypes.c_void_p),
+        ("Release", ctypes.c_void_p),
+        ("EnumAudioEndpoints", ctypes.c_void_p),
+        ("GetDefaultAudioEndpoint", ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p))),
+    ]
+
+
+class _IMMDeviceEnumerator(ctypes.Structure):
+    _fields_ = [("lpVtbl", ctypes.POINTER(_IMMDeviceEnumeratorVTable))]
+
+
+class _IMMDeviceVTable(ctypes.Structure):
+    _fields_ = [
+        ("QueryInterface", ctypes.c_void_p),
+        ("AddRef", ctypes.c_void_p),
+        ("Release", ctypes.c_void_p),
+        ("Activate", ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, ctypes.POINTER(_GUID), ctypes.wintypes.DWORD, ctypes.POINTER(_PROPVARIANT), ctypes.POINTER(ctypes.c_void_p))),
+    ]
+
+
+class _IMMDevice(ctypes.Structure):
+    _fields_ = [("lpVtbl", ctypes.POINTER(_IMMDeviceVTable))]
+
+
+class _IAudioEndpointVolumeVTable(ctypes.Structure):
+    _fields_ = [
+        ("QueryInterface", ctypes.c_void_p),
+        ("AddRef", ctypes.c_void_p),
+        ("Release", ctypes.c_void_p),
+        ("RegisterControlChangeNotify", ctypes.c_void_p),
+        ("UnregisterControlChangeNotify", ctypes.c_void_p),
+        ("GetChannelCount", ctypes.c_void_p),
+        ("SetMasterVolumeLevel", ctypes.c_void_p),
+        ("SetMasterVolumeLevelScalar", ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, ctypes.c_float, ctypes.c_void_p)),
+        ("GetMasterVolumeLevel", ctypes.c_void_p),
+        ("GetMasterVolumeLevelScalar", ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, ctypes.POINTER(ctypes.c_float))),
+    ]
+
+
+class _IAudioEndpointVolume(ctypes.Structure):
+    _fields_ = [("lpVtbl", ctypes.POINTER(_IAudioEndpointVolumeVTable))]
+
+
+_CLSID_MMDeviceEnumerator = _GUID("bcde0395-e52f-467c-8e3d-c4579291692e")
+_IID_IMMDeviceEnumerator = _GUID("a95664d2-9614-4f35-a746-de8db63617e6")
+_IID_IAudioEndpointVolume = _GUID("5cdf2c82-841e-4546-9722-0cf74078229a")
+_EDataFlow_eRender = 0
+_ERole_eMultimedia = 1
+
+_duck_audio_lock = threading.Lock()
+_duck_audio_state = {
+    "active": False,
+    "original_scalar": None,
+}
+
 
 def type_text(text: str, char_delay: float = 0.0):
     """Type text into the currently focused window using SendInput (no clipboard)."""
@@ -440,6 +838,123 @@ def type_text(text: str, char_delay: float = 0.0):
         n = len(events)
         arr = (_INPUT * n)(*events)
         _user32.SendInput(n, arr, _input_size)
+
+
+def _release_com(obj_ptr) -> None:
+    if obj_ptr:
+        try:
+            unk = ctypes.cast(obj_ptr, ctypes.POINTER(_IUnknown))
+            release = ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(unk.contents.lpVtbl.contents.Release)
+            release(obj_ptr)
+        except Exception:
+            pass
+
+
+def _default_endpoint_volume() -> ctypes.c_void_p | None:
+    enum_ptr = ctypes.c_void_p()
+    hr = _ole32.CoCreateInstance(
+        ctypes.byref(_CLSID_MMDeviceEnumerator),
+        None,
+        CLSCTX_INPROC_SERVER,
+        ctypes.byref(_IID_IMMDeviceEnumerator),
+        ctypes.byref(enum_ptr),
+    )
+    if hr not in (S_OK, S_FALSE) or not enum_ptr.value:
+        return None
+    device_ptr = ctypes.c_void_p()
+    endpoint_ptr = ctypes.c_void_p()
+    try:
+        enum_obj = ctypes.cast(enum_ptr, ctypes.POINTER(_IMMDeviceEnumerator))
+        hr = enum_obj.contents.lpVtbl.contents.GetDefaultAudioEndpoint(enum_ptr, _EDataFlow_eRender, _ERole_eMultimedia, ctypes.byref(device_ptr))
+        if hr not in (S_OK, S_FALSE) or not device_ptr.value:
+            return None
+        device_obj = ctypes.cast(device_ptr, ctypes.POINTER(_IMMDevice))
+        hr = device_obj.contents.lpVtbl.contents.Activate(
+            device_ptr,
+            ctypes.byref(_IID_IAudioEndpointVolume),
+            CLSCTX_INPROC_SERVER,
+            None,
+            ctypes.byref(endpoint_ptr),
+        )
+        if hr not in (S_OK, S_FALSE) or not endpoint_ptr.value:
+            return None
+        return endpoint_ptr
+    finally:
+        _release_com(device_ptr)
+        _release_com(enum_ptr)
+
+
+def _get_master_volume_scalar() -> float | None:
+    init_hr = _ole32.CoInitializeEx(None, COINIT_APARTMENTTHREADED)
+    endpoint_ptr = None
+    try:
+        endpoint_ptr = _default_endpoint_volume()
+        if not endpoint_ptr:
+            return None
+        endpoint_obj = ctypes.cast(endpoint_ptr, ctypes.POINTER(_IAudioEndpointVolume))
+        value = ctypes.c_float()
+        hr = endpoint_obj.contents.lpVtbl.contents.GetMasterVolumeLevelScalar(endpoint_ptr, ctypes.byref(value))
+        if hr not in (S_OK, S_FALSE):
+            return None
+        return float(value.value)
+    finally:
+        _release_com(endpoint_ptr)
+        if init_hr in (S_OK, S_FALSE):
+            _ole32.CoUninitialize()
+
+
+def _set_master_volume_scalar(value: float) -> bool:
+    init_hr = _ole32.CoInitializeEx(None, COINIT_APARTMENTTHREADED)
+    endpoint_ptr = None
+    try:
+        endpoint_ptr = _default_endpoint_volume()
+        if not endpoint_ptr:
+            return False
+        endpoint_obj = ctypes.cast(endpoint_ptr, ctypes.POINTER(_IAudioEndpointVolume))
+        hr = endpoint_obj.contents.lpVtbl.contents.SetMasterVolumeLevelScalar(endpoint_ptr, ctypes.c_float(max(0.0, min(1.0, value))), None)
+        return hr in (S_OK, S_FALSE)
+    finally:
+        _release_com(endpoint_ptr)
+        if init_hr in (S_OK, S_FALSE):
+            _ole32.CoUninitialize()
+
+
+def _begin_audio_ducking(config: dict):
+    if not config.get("duck_audio_during_dictation", False):
+        return
+    target_percent = max(0, min(100, int(config.get("duck_audio_level_percent", DEFAULT_CONFIG["duck_audio_level_percent"]))))
+    target_scalar = target_percent / 100.0
+    with _duck_audio_lock:
+        if _duck_audio_state["active"]:
+            return
+        current = _get_master_volume_scalar()
+        if current is None:
+            print("[AUDIO] Could not read master volume for ducking.", flush=True)
+            return
+        _duck_audio_state["original_scalar"] = current
+        _duck_audio_state["active"] = True
+        if current <= target_scalar:
+            print(f"[AUDIO] Ducking skipped - current volume already <= {target_percent}%.", flush=True)
+            return
+        if _set_master_volume_scalar(target_scalar):
+            print(f"[AUDIO] Ducked Windows output volume to {target_percent}%.", flush=True)
+        else:
+            print("[AUDIO] Failed to lower Windows output volume.", flush=True)
+
+
+def _end_audio_ducking():
+    with _duck_audio_lock:
+        if not _duck_audio_state["active"]:
+            return
+        original = _duck_audio_state["original_scalar"]
+        _duck_audio_state["active"] = False
+        _duck_audio_state["original_scalar"] = None
+    if original is None:
+        return
+    if _set_master_volume_scalar(float(original)):
+        print("[AUDIO] Restored Windows output volume.", flush=True)
+    else:
+        print("[AUDIO] Failed to restore Windows output volume.", flush=True)
 
 
 def delete_chars(n: int):
@@ -557,21 +1072,24 @@ def _clipboard_set_text(text: str):
         _user32.CloseClipboard()
 
 
-def paste_text(text: str, method: str = "paste_ctrl_v"):
+def paste_text(text: str, method: str = "paste_ctrl_v", source: str = "session"):
     """Paste plain text quickly via the clipboard, then restore text clipboard content."""
     previous = _clipboard_get_text()
     restore_delay = 0.05
     try:
-        print(f"[PASTE] Preparing {method} with {len(text)} chars.", flush=True)
+        preview = _safe_console_text(repr(text[:80]))
+        print(f"[PASTE] Preparing {method} from {source} with {len(text)} chars.", flush=True)
+        print(f"[PASTE] Outgoing preview: {preview}", flush=True)
         _clipboard_set_text(text)
-        print("[PASTE] Clipboard populated with outgoing text.", flush=True)
-        time.sleep(0.05)
+        confirm = _clipboard_get_text()
+        print(f"[PASTE] Clipboard populated with outgoing text (readback match={confirm == text}).", flush=True)
+        time.sleep(0.09 if method == "paste_right_click" else 0.05)
         if method == "paste_right_click":
             print("[PASTE] Sending right-click paste trigger.", flush=True)
             _send_right_click()
             # Console-style right-click paste can consume the clipboard slightly
             # after the click event, so restore later than Ctrl+V paths.
-            restore_delay = 0.35
+            restore_delay = 0.45
         else:
             print("[PASTE] Sending Ctrl+V paste trigger.", flush=True)
             _send_ctrl_v()
@@ -672,32 +1190,36 @@ def choose_insert_mode() -> str:
     return "paste_ctrl_v"
 
 
-def hotkey_mode_settings(config: dict, profile: str) -> tuple[bool, bool]:
-    """Return (live_mode, simple_mode) for the given hotkey profile."""
+def hotkey_mode_settings(config: dict, profile: str) -> tuple[str, bool]:
+    """Return (mode_name, simple_mode) for the given hotkey profile."""
     if profile == "fast":
-        return (
-            bool(config.get("fast_live_mode", config.get("live_mode", False))),
-            bool(config.get("fast_simple_mode", config.get("simple_mode", True))),
-        )
-    return (
-        bool(config.get("main_live_mode", config.get("live_mode", False))),
-        bool(config.get("main_simple_mode", config.get("simple_mode", True))),
-    )
+        mode_name = (config.get("fast_mode") or "").strip().lower()
+        if not mode_name:
+            mode_name = "live" if config.get("fast_live_mode", config.get("live_mode", False)) else "classic" if config.get("fast_simple_mode", config.get("simple_mode", True)) else "preview"
+        simple_mode = bool(config.get("fast_simple_mode", config.get("simple_mode", True)))
+    else:
+        mode_name = (config.get("main_mode") or "").strip().lower()
+        if not mode_name:
+            mode_name = "live" if config.get("main_live_mode", config.get("live_mode", False)) else "classic" if config.get("main_simple_mode", config.get("simple_mode", True)) else "preview"
+        simple_mode = bool(config.get("main_simple_mode", config.get("simple_mode", True)))
+    if mode_name not in {"classic", "preview", "live"}:
+        mode_name = "preview"
+    return mode_name, simple_mode
 
 
-def session_mode_settings(config: dict, insert_mode: str, profile: str) -> tuple[bool, bool]:
-    """Return (live_mode, simple_mode) using hotkey defaults plus focused-class overrides."""
-    live_mode, simple_mode = hotkey_mode_settings(config, profile)
+def session_mode_settings(config: dict, insert_mode: str, profile: str) -> tuple[str, bool]:
+    """Return (mode_name, simple_mode) using hotkey defaults plus focused-class overrides."""
+    mode_name, simple_mode = hotkey_mode_settings(config, profile)
     cls = focused_class()
 
     if cls in _SIMPLE_MODE_INPUT_CLASSES:
         simple_mode = True
 
     if insert_mode == "type" and cls in _LIVE_MODE_INPUT_CLASSES:
-        live_mode = True
+        mode_name = "live"
         simple_mode = False
 
-    return live_mode, simple_mode
+    return mode_name, simple_mode
 
 
 # ── Audio ─────────────────────────────────────────────────────────────────────
@@ -751,7 +1273,14 @@ def _resample_audio(audio: np.ndarray, from_sr: int, to_sr: int) -> np.ndarray:
     return np.clip(out, -32768, 32767).astype(np.int16).reshape(-1, 1)
 
 
-def _record_with_vad(config: dict, on_chunk_ready=None, hotkey_name: str = "ptt"):
+def _record_with_vad(
+    config: dict,
+    on_chunk_ready=None,
+    hotkey_name: str = "ptt",
+    post_edit_active: bool = False,
+    on_post_edit_toggle=None,
+    insert_mode: str = "type",
+):
     """
     Record while the hotkey is held.  Whenever a pause (_VAD_SILENCE_SECS of
     silence after _VAD_MIN_SPEECH_S of speech) is detected the accumulated
@@ -779,7 +1308,7 @@ def _record_with_vad(config: dict, on_chunk_ready=None, hotkey_name: str = "ptt"
     # This avoids PortAudio -9997 on WASAPI devices locked to e.g. 48000 Hz.
     native_sr = _device_sample_rate(device) or target_sr
     if native_sr != target_sr:
-        print(f"[REC] Device native {native_sr} Hz → resampling to {target_sr} Hz", flush=True)
+        print(f"[REC] Device native {native_sr} Hz -> resampling to {target_sr} Hz", flush=True)
 
     BLOCK        = 512
     SIL_BLKS     = max(1, int(sil_secs   * native_sr / BLOCK))
@@ -828,11 +1357,54 @@ def _record_with_vad(config: dict, on_chunk_ready=None, hotkey_name: str = "ptt"
             default=0.0,
         )
 
+    post_edit_active = _post_edit_profile_name(post_edit_active)
+    toggle_y_down = False
+    toggle_enabled = on_post_edit_toggle is not None
+    toggle_key = (config.get("post_edit_toggle_key") or DEFAULT_CONFIG["post_edit_toggle_key"]).strip().lower()
+    if not toggle_key:
+        toggle_key = DEFAULT_CONFIG["post_edit_toggle_key"]
+
+    toggle_press_hook = None
+    toggle_release_hook = None
+
+    if on_post_edit_toggle:
+        try:
+            on_post_edit_toggle(post_edit_active)
+        except Exception:
+            pass
+
     try:
+        if toggle_enabled and insert_mode == "paste_right_click":
+            try:
+                toggle_press_hook = keyboard.on_press_key(toggle_key, lambda _e: None, suppress=True)
+                toggle_release_hook = keyboard.on_release_key(toggle_key, lambda _e: None, suppress=True)
+                print(f"[POST] Suppressing toggle key {toggle_key.upper()} for paste_right_click target.", flush=True)
+            except Exception as exc:
+                print(f"[POST] Failed to suppress toggle key {toggle_key.upper()}: {_safe_console_text(exc)}", flush=True)
+
         with sd.InputStream(device=device, samplerate=native_sr, channels=1,
                             dtype="int16", blocksize=BLOCK) as stream:
             print("[REC] Recording (VAD)...", flush=True)
             while (_native_hotkeys.is_pressed(hotkey_name) if _native_hotkeys else keyboard.is_pressed(config["hotkey"])):
+                y_down = False
+                if toggle_enabled:
+                    try:
+                        y_down = keyboard.is_pressed(toggle_key)
+                    except Exception:
+                        y_down = False
+                    if y_down and not toggle_y_down:
+                        post_edit_active = _next_post_edit_profile(post_edit_active)
+                        state_label = post_edit_active.upper() if post_edit_active else "OFF"
+                        print(
+                            f"[POST] Session post-edit profile set to {state_label} via {toggle_key.upper()}.",
+                            flush=True,
+                        )
+                        try:
+                            on_post_edit_toggle(post_edit_active)
+                        except Exception:
+                            pass
+                toggle_y_down = y_down
+
                 data, _ = stream.read(BLOCK)
                 blk = data.copy()
                 all_data.append(blk)
@@ -875,26 +1447,39 @@ def _record_with_vad(config: dict, on_chunk_ready=None, hotkey_name: str = "ptt"
                             current = current[-tail_blks:]
                         print(f"[VAD] Silence window, no speech "
                               f"(peak={chunk_peak:.0f} < {sil_rms}) "
-                              f"— carrying tail forward", flush=True)
+                              f"- carrying tail forward", flush=True)
                     _reset_chunk()
 
                 # ── Max chunk duration guard ───────────────────────────────
                 chunk_dur = len(current) * BLOCK / native_sr
                 if chunk_dur >= max_chunk_s and chunk_peak >= sil_rms:
-                    print(f"[VAD] Max chunk duration {max_chunk_s}s reached — sending", flush=True)
+                    print(f"[VAD] Max chunk duration {max_chunk_s}s reached - sending", flush=True)
                     _submit(np.concatenate(current))
                     current = []
                     _reset_chunk()
     except Exception as exc:
         print(f"[REC] Stream error: {exc}", flush=True)
-        return None, [], None
+        return None, [], None, post_edit_active
+    finally:
+        for hook in (toggle_press_hook, toggle_release_hook):
+            if hook is not None:
+                try:
+                    keyboard.unhook(hook)
+                except Exception:
+                    pass
 
     print(f"[REC] Hotkey released. RMS min={rms_min:.0f}  max={rms_max:.0f}  "
           f"silence-threshold={sil_rms}  chunks-sent={len(pending)}", flush=True)
 
     if len(all_data) < MIN_BLKS and not pending:
         print("[REC] Too short, ignoring.", flush=True)
-        return None, [], None
+        return None, [], None, post_edit_active
+    soft_floor = max(120.0, sil_rms * 0.35)
+    if not pending and rms_max < soft_floor:
+        print(f"[REC] No meaningful speech detected (max={rms_max:.0f} < soft floor {soft_floor:.0f}), ignoring.", flush=True)
+        return None, [], None, post_edit_active
+    if not pending and rms_max < sil_rms:
+        print(f"[REC] Soft speech stayed below VAD threshold (max={rms_max:.0f} < {sil_rms}) - transcribing anyway.", flush=True)
 
     raw_full  = np.concatenate(all_data) if all_data else None
     raw_tail  = np.concatenate(current)  if current  else None
@@ -906,7 +1491,7 @@ def _record_with_vad(config: dict, on_chunk_ready=None, hotkey_name: str = "ptt"
     if remaining is not None and len(remaining) < int(0.3 * target_sr) and pending:
         remaining = None
 
-    return full_audio, pending, remaining
+    return full_audio, pending, remaining, post_edit_active
 
 
 # ── Transcription ─────────────────────────────────────────────────────────────
@@ -914,8 +1499,209 @@ def _record_with_vad(config: dict, on_chunk_ready=None, hotkey_name: str = "ptt"
 FAILED_AUDIO_DIR = _app_dir() / "failed_audio"
 
 
+def _post_edit_enabled(config: dict, profile: str, live_mode_selected: bool) -> str:
+    return ""
+
+
+def _history_entry_prompt_text(entry: dict) -> str:
+    text = (entry.get("text") or "").strip()
+    notes = (entry.get("editor_notes") or "").strip()
+    if text and notes:
+        return f"{text}\n\nEditor notes:\n{notes}"
+    return text
+
+
+def _recent_transcript_placeholders() -> dict[str, str]:
+    recent = [
+        _history_entry_prompt_text(e)
+        for e in reversed(list(_history))
+        if e.get("text") and e.get("post_edit_active")
+    ]
+    placeholders: dict[str, str] = {}
+    recent_block_lines: list[str] = []
+    for i in range(5):
+        value = recent[i] if i < len(recent) else ""
+        placeholders[f"last_{i + 1}"] = value
+        if value:
+            recent_block_lines.append(f"{i + 1}. {value}")
+    placeholders["recent_transcripts"] = "\n".join(recent_block_lines)
+    return placeholders
+
+
+def _normalize_promptish_text(value: str) -> str:
+    return re.sub(r"\s+", " ", (value or "").strip()).lower()
+
+
+def _looks_like_prompt_echo(edited_text: str, *, transcript: str, system_prompt: str, developer_prompt: str, rendered_user_prompt: str, project_context: str) -> bool:
+    edited_norm = _normalize_promptish_text(edited_text)
+    transcript_norm = _normalize_promptish_text(transcript)
+    if not edited_norm or len(edited_norm) < 80:
+        return False
+    if transcript_norm and edited_norm == transcript_norm:
+        return False
+
+    prompt_sources = [
+        system_prompt,
+        developer_prompt,
+        rendered_user_prompt,
+        project_context,
+    ]
+    for source in prompt_sources:
+        source_norm = _normalize_promptish_text(source)
+        if len(source_norm) < 80:
+            continue
+        if edited_norm == source_norm:
+            return True
+        if edited_norm in source_norm:
+            return True
+        if source_norm in edited_norm and len(source_norm) >= max(120, int(len(edited_norm) * 0.6)):
+            return True
+
+    suspicious_markers = (
+        "you are a careful transcript post-editor",
+        "the source input is spoken dictation",
+        "preserve:",
+        "improve:",
+        "remove obvious fillers",
+    )
+    return any(marker in edited_norm for marker in suspicious_markers)
+
+
+def _post_edit_text(text: str, config: dict, profile: str, edit_profile: str = "dev") -> tuple[str, str, bool]:
+    api_key = _openai_api_key()
+    model = (config.get("openai_model") or "").strip()
+    edit_profile = _post_edit_profile_name(edit_profile) or "dev"
+    prompt_sections = _load_prompt_markdown(config, edit_profile)
+    system_prompt = prompt_sections.get("system") or ""
+    developer_prompt = prompt_sections.get("developer") or ""
+    user_prompt_template = prompt_sections.get("user") or ""
+    project_context = ""
+    reasoning_effort = (config.get("openai_reasoning_effort") or "low").strip().lower()
+
+    if not api_key or not model or not user_prompt_template.strip():
+        print("[POST] Post-edit skipped - OpenAI settings incomplete (set OPENAI_API_KEY and LLM settings).", flush=True)
+        return text, "", False
+
+    prompt_values = {
+        "transcript": text,
+        "project_context": project_context,
+        "agent_guidance": project_context,
+        **_recent_transcript_placeholders(),
+    }
+    rendered_developer_prompt = developer_prompt
+    for key, value in prompt_values.items():
+        rendered_developer_prompt = rendered_developer_prompt.replace(f"{{{key}}}", value)
+
+    rendered_user_prompt = user_prompt_template
+    for key, value in prompt_values.items():
+        rendered_user_prompt = rendered_user_prompt.replace(f"{{{key}}}", value)
+    input_items = []
+    if system_prompt.strip():
+        input_items.append(
+            {
+                "role": "system",
+                "content": [{"type": "input_text", "text": system_prompt}],
+            }
+        )
+    if rendered_developer_prompt.strip():
+        input_items.append(
+            {
+                "role": "developer",
+                "content": [{"type": "input_text", "text": rendered_developer_prompt}],
+            }
+        )
+    input_items.append(
+        {
+            "role": "user",
+            "content": [{"type": "input_text", "text": rendered_user_prompt}],
+        }
+    )
+
+    payload = {
+        "model": model,
+        "input": input_items,
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "post_edit_result",
+                "strict": True,
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "edited_text": {"type": "string"},
+                        "editor_notes": {"type": "string"},
+                    },
+                    "required": ["edited_text", "editor_notes"],
+                    "additionalProperties": False,
+                },
+            }
+        },
+    }
+    if reasoning_effort:
+        payload["reasoning"] = {"effort": reasoning_effort}
+
+    print(f"[POST] Sending transcript to OpenAI post-editor via {model} ({profile}/{edit_profile}).", flush=True)
+    try:
+        resp = requests.post(
+            "https://api.openai.com/v1/responses",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=60,
+        )
+        print(f"[POST] HTTP {resp.status_code}", flush=True)
+        print(f"[POST] Response: {_safe_console_text(resp.text)}", flush=True)
+        resp.raise_for_status()
+        body = resp.json()
+
+        raw_json = None
+        for item in body.get("output", []):
+            for content in item.get("content", []):
+                if content.get("type") in {"output_text", "text"} and content.get("text"):
+                    raw_json = content["text"]
+                    break
+            if raw_json:
+                break
+
+        if not raw_json:
+            print("[POST] No structured output text returned - keeping original transcript.", flush=True)
+            return text, "", False
+
+        print(f"[POST] Structured output: {_safe_console_text(raw_json)}", flush=True)
+        parsed = json.loads(raw_json)
+        edited = (parsed.get("edited_text") or "").strip()
+        editor_notes = (parsed.get("editor_notes") or "").strip()
+        if not edited:
+            print("[POST] Empty edited text returned - keeping original transcript.", flush=True)
+            return text, editor_notes, False
+        if _looks_like_prompt_echo(
+            edited,
+            transcript=text,
+            system_prompt=system_prompt,
+            developer_prompt=rendered_developer_prompt,
+            rendered_user_prompt=rendered_user_prompt,
+            project_context=project_context,
+        ):
+            print("[POST] Edited text looks like prompt/context echo - keeping original transcript.", flush=True)
+            return text, editor_notes, False
+
+        print(f"[POST] Edited text: {_safe_console_text(repr(edited))}", flush=True)
+        if editor_notes:
+            print(f"[POST] Editor notes: {_safe_console_text(repr(editor_notes))}", flush=True)
+        print("[POST] Post-edit complete.", flush=True)
+        return edited, editor_notes, True
+    except Exception as exc:
+        print(f"[POST] Post-edit failed: {_safe_console_text(exc)}", flush=True)
+        return text, "", False
+
+
 def _post_wav_bytes(wav_bytes: bytes, config: dict) -> tuple[str | None, str | None]:
-    """POST raw WAV bytes to the transcription server. Returns (text, error)."""
+    """Send raw WAV bytes to the configured transcription backend. Returns (text, error)."""
+    backend = (config.get("transcription_backend") or DEFAULT_CONFIG["transcription_backend"]).strip().lower()
+    if backend == "openai":
+        return _post_wav_bytes_openai(wav_bytes, config)
     url  = config["server_url"]
     lang = config.get("language")
     print(f"[API] {len(wav_bytes)//1024} KB -> {url}...", flush=True)
@@ -938,6 +1724,60 @@ def _post_wav_bytes(wav_bytes: bytes, config: dict) -> tuple[str | None, str | N
         msg = f"Server error (HTTP {exc.response.status_code})"
     except requests.RequestException:
         msg = "Transcription failed"
+    print(f"[API] Error: {msg}", flush=True)
+    return None, msg
+
+
+def _post_wav_bytes_openai(wav_bytes: bytes, config: dict) -> tuple[str | None, str | None]:
+    api_key = _openai_api_key()
+    model = (config.get("openai_transcription_model") or DEFAULT_CONFIG["openai_transcription_model"]).strip()
+    lang = (config.get("language") or "").strip()
+    prompt = (config.get("openai_transcription_prompt") or "").strip()
+
+    if not api_key:
+        msg = "OpenAI API key missing"
+        print(f"[API] Error: {msg}", flush=True)
+        return None, msg
+    if not model:
+        msg = "OpenAI transcription model missing"
+        print(f"[API] Error: {msg}", flush=True)
+        return None, msg
+
+    print(f"[API] {len(wav_bytes)//1024} KB -> OpenAI audio/transcriptions ({model})...", flush=True)
+    try:
+        data = {
+            "model": model,
+            "response_format": "json",
+        }
+        if lang:
+            data["language"] = lang
+        if prompt:
+            data["prompt"] = prompt
+        resp = requests.post(
+            "https://api.openai.com/v1/audio/transcriptions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+            },
+            data=data,
+            files={"file": ("audio.wav", wav_bytes, "audio/wav")},
+            timeout=60,
+        )
+        print(f"[API] HTTP {resp.status_code}", flush=True)
+        print(f"[API] Response: {_safe_console_text(resp.text)}", flush=True)
+        resp.raise_for_status()
+        body = resp.json()
+        text = (body.get("text") or "").strip()
+        print(f"[API] Got: {_safe_console_text(repr(text))}", flush=True)
+        return text or None, None
+    except requests.exceptions.ConnectionError:
+        msg = "OpenAI unavailable"
+    except requests.exceptions.Timeout:
+        msg = "OpenAI request timed out"
+    except requests.exceptions.HTTPError as exc:
+        code = getattr(exc.response, "status_code", "?")
+        msg = f"OpenAI error (HTTP {code})"
+    except requests.RequestException:
+        msg = "OpenAI transcription failed"
     print(f"[API] Error: {msg}", flush=True)
     return None, msg
 
@@ -972,6 +1812,15 @@ def _save_failed_wav(audio: np.ndarray, sr: int) -> Path:
     return path
 
 
+def _should_save_failed_wav(error: str | None) -> bool:
+    if not error:
+        return False
+    skip_errors = {
+        "Service unavailable",
+    }
+    return error not in skip_errors
+
+
 def retry_transcription(wav_path: str, time_key: str, config: dict) -> tuple[str | None, str | None]:
     """Re-send a saved failed WAV. On success update the history entry and delete the file."""
     path = Path(wav_path)
@@ -998,11 +1847,648 @@ def retry_transcription(wav_path: str, time_key: str, config: dict) -> tuple[str
 
 _session_lock = threading.Lock()
 _last_typed   = [""]   # text from the most recent successful transcription
+_editor_notes_lock = threading.Lock()
+_pending_editor_notes = {
+    "text": "",
+    "expires_at": 0.0,
+    "duration": 0.0,
+}
+
+
+def _format_editor_notes_for_insert(text: str) -> str:
+    notes = (text or "").strip()
+    if not notes:
+        return ""
+    return f"\n\nEditor notes:\n{notes}"
+
+
+def _show_pending_editor_notes(text: str, duration: float = 4.0):
+    notes = (text or "").strip()
+    if not notes:
+        return
+    with _editor_notes_lock:
+        _pending_editor_notes["text"] = notes
+        _pending_editor_notes["duration"] = duration
+        _pending_editor_notes["expires_at"] = time.time() + duration
+    _ensure_overlay()
+    _set_overlay(_OVL_EDITOR_NOTES)
+
+
+def _editor_notes_overlay_duration(text: str, config: dict) -> float:
+    notes = (text or "").strip()
+    base = max(0.5, float(config.get("editor_notes_overlay_seconds", DEFAULT_CONFIG["editor_notes_overlay_seconds"])))
+    chars_per_extra_second = max(
+        1.0,
+        float(
+            config.get(
+                "editor_notes_chars_per_extra_second",
+                DEFAULT_CONFIG["editor_notes_chars_per_extra_second"],
+            )
+        ),
+    )
+    if not notes:
+        return base
+    return base + (len(notes) / chars_per_extra_second)
+
+
+def _clear_pending_editor_notes():
+    with _editor_notes_lock:
+        _pending_editor_notes["text"] = ""
+        _pending_editor_notes["duration"] = 0.0
+        _pending_editor_notes["expires_at"] = 0.0
+    if _overlay_state[0] == _OVL_EDITOR_NOTES:
+        _set_overlay(_OVL_IDLE)
+
+
+def _peek_pending_editor_notes() -> str | None:
+    with _editor_notes_lock:
+        notes = _pending_editor_notes["text"]
+        expires_at = _pending_editor_notes["expires_at"]
+    if not notes or time.time() >= expires_at:
+        _clear_pending_editor_notes()
+        return None
+    return notes
+
+
+def _consume_pending_editor_notes() -> str | None:
+    notes = _peek_pending_editor_notes()
+    if not notes:
+        return None
+    _clear_pending_editor_notes()
+    return notes
+
+
+_draft_lock = threading.Lock()
+_pending_draft = {
+    "active": False,
+    "text": "",
+    "editor_notes": "",
+    "profile": "main",
+    "post_edit": False,
+    "post_edit_profile": "",
+    "post_edit_failed": False,
+    "edit_in_progress": False,
+    "review_open": False,
+    "created_at": 0.0,
+}
+_preview_overlay_lock = threading.Lock()
+_preview_overlay_state = {
+    "visible": False,
+    "text": "",
+    "editor_notes": "",
+    "status": "",
+    "profile": "main",
+    "post_edit": False,
+    "loading": False,
+}
+_preview_overlay_started = [False]
+_draft_tap_lock = threading.Lock()
+_draft_tap_state = {
+    "stamp": 0.0,
+    "include_notes": False,
+}
+_current_config = [None]
+
+_DRAFT_TAP_RELEASE_MAX = 0.28
+_DRAFT_SINGLE_TAP_DELAY = 0.38
+_DRAFT_DOUBLE_TAP_GAP = 0.45
+_DRAFT_NOTES_GRACE = 0.24
+
+
+class _POINT(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+
+class _MONITORINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", ctypes.wintypes.DWORD),
+        ("rcMonitor", _RECT),
+        ("rcWork", _RECT),
+        ("dwFlags", ctypes.wintypes.DWORD),
+    ]
+
+
+_user32.MonitorFromPoint.argtypes = (_POINT, ctypes.wintypes.DWORD)
+_user32.MonitorFromPoint.restype = ctypes.wintypes.HMONITOR
+_user32.GetMonitorInfoW.argtypes = (ctypes.wintypes.HMONITOR, ctypes.POINTER(_MONITORINFO))
+_user32.GetMonitorInfoW.restype = ctypes.c_bool
+_user32.GetWindowLongW.argtypes = (ctypes.wintypes.HWND, ctypes.c_int)
+_user32.GetWindowLongW.restype = ctypes.c_long
+_user32.SetWindowLongW.argtypes = (ctypes.wintypes.HWND, ctypes.c_int, ctypes.c_long)
+_user32.SetWindowLongW.restype = ctypes.c_long
+_user32.SetWindowPos.argtypes = (
+    ctypes.wintypes.HWND,
+    ctypes.wintypes.HWND,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.wintypes.UINT,
+)
+_user32.SetWindowPos.restype = ctypes.c_bool
+
+MONITOR_DEFAULTTONEAREST = 2
+GWL_EXSTYLE = -20
+WS_EX_TOOLWINDOW = 0x00000080
+WS_EX_NOACTIVATE = 0x08000000
+SWP_NOMOVE = 0x0002
+SWP_NOSIZE = 0x0001
+SWP_NOZORDER = 0x0004
+SWP_FRAMECHANGED = 0x0020
+
+
+def _monitor_work_area(x: int, y: int) -> _RECT:
+    pt = _POINT(x, y)
+    monitor = _user32.MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST)
+    if monitor:
+        info = _MONITORINFO(cbSize=ctypes.sizeof(_MONITORINFO))
+        if _user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+            return info.rcWork
+    return _RECT(0, 0, _user32.GetSystemMetrics(0), _user32.GetSystemMetrics(1))
+
+
+def _apply_noactivate(hwnd: int):
+    try:
+        exstyle = _user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+        exstyle |= WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
+        _user32.SetWindowLongW(hwnd, GWL_EXSTYLE, exstyle)
+        _user32.SetWindowPos(hwnd, None, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED)
+    except Exception:
+        pass
+
+
+def _set_preview_overlay(*, visible: bool, text: str = "", editor_notes: str = "", status: str = "", profile: str = "main", post_edit: bool = False, loading: bool = False):
+    with _preview_overlay_lock:
+        _preview_overlay_state.update({
+            "visible": bool(visible),
+            "text": text,
+            "editor_notes": editor_notes,
+            "status": status,
+            "profile": profile,
+            "post_edit": post_edit,
+            "loading": bool(loading),
+        })
+
+
+def _show_preview_overlay(text: str, status: str, profile: str, post_edit: bool = False, loading: bool = False, editor_notes: str = ""):
+    _ensure_preview_overlay()
+    _set_preview_overlay(
+        visible=True,
+        text=text,
+        editor_notes=editor_notes,
+        status=status,
+        profile=profile,
+        post_edit=post_edit,
+        loading=loading,
+    )
+
+
+def _hide_preview_overlay():
+    _set_preview_overlay(visible=False)
+
+
+def _set_pending_draft(text: str, profile: str, post_edit: bool | str, editor_notes: str = "", post_edit_failed: bool = False):
+    notes = (editor_notes or "").strip()
+    post_edit_profile = _post_edit_profile_name(post_edit)
+    with _draft_lock:
+        _pending_draft.update({
+            "active": True,
+            "text": text,
+            "editor_notes": notes,
+            "profile": profile,
+            "post_edit": bool(post_edit_profile or post_edit is True),
+            "post_edit_profile": post_edit_profile,
+            "post_edit_failed": bool(post_edit_failed),
+            "edit_in_progress": False,
+            "review_open": False,
+            "created_at": time.time(),
+        })
+    if post_edit_failed:
+        status = "Post-edit failed - single tap inserts raw text, tap + modifier retries edit, double tap opens review"
+    else:
+        status = "Edited preview ready - tap hotkey to insert, double-tap to review" if post_edit else "Preview ready - tap hotkey to insert, double-tap to edit"
+    _show_preview_overlay(text=text, editor_notes=notes, status=status, profile=profile, post_edit=post_edit_profile, loading=False)
+
+
+def _peek_pending_draft() -> dict | None:
+    with _draft_lock:
+        if not _pending_draft["active"]:
+            return None
+        return dict(_pending_draft)
+
+
+def _clear_pending_draft():
+    with _draft_lock:
+        _pending_draft.update({
+            "active": False,
+            "text": "",
+            "editor_notes": "",
+            "profile": "main",
+            "post_edit": False,
+            "post_edit_profile": "",
+            "post_edit_failed": False,
+            "edit_in_progress": False,
+            "review_open": False,
+            "created_at": 0.0,
+        })
+    with _draft_tap_lock:
+        _draft_tap_state["stamp"] = 0.0
+        _draft_tap_state["include_notes"] = False
+    _hide_preview_overlay()
+
+
+def _set_pending_draft_review(open_: bool):
+    draft = None
+    with _draft_lock:
+        if _pending_draft["active"]:
+            _pending_draft["review_open"] = bool(open_)
+            draft = dict(_pending_draft)
+    if not draft:
+        _hide_preview_overlay()
+        return
+    if open_:
+        _hide_preview_overlay()
+    else:
+        if draft.get("edit_in_progress"):
+            status = "Post-editing"
+        else:
+            status = "Edited preview ready - tap hotkey to insert, double-tap to review" if draft["post_edit"] else "Preview ready - tap hotkey to insert, double-tap to edit"
+        _show_preview_overlay(
+            text=draft["text"],
+            editor_notes=draft.get("editor_notes", ""),
+            status=status,
+            profile=draft["profile"],
+            post_edit=draft.get("post_edit_profile", "") if draft.get("post_edit") else "",
+            loading=False,
+        )
+
+
+def _draft_review_copy_text(text: str):
+    try:
+        _clipboard_set_text(text)
+        print("[DRAFT] Copied review text to clipboard.", flush=True)
+    except Exception as exc:
+        print(f"[DRAFT] Clipboard copy failed: {_safe_console_text(exc)}", flush=True)
+
+
+def _post_edit_toggle_key(config: dict) -> str:
+    return (config.get("post_edit_toggle_key") or DEFAULT_CONFIG["post_edit_toggle_key"]).strip().lower()
+
+
+def _wait_for_notes_insert_request(config: dict, timeout_s: float = _DRAFT_NOTES_GRACE) -> bool:
+    toggle_key = _post_edit_toggle_key(config)
+    if not toggle_key:
+        return False
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        try:
+            if keyboard.is_pressed(toggle_key):
+                return True
+        except Exception:
+            return False
+        time.sleep(0.01)
+    return False
+
+
+def _current_draft_status(draft: dict) -> str:
+    if draft.get("edit_in_progress"):
+        return "Post-editing"
+    if draft.get("post_edit_failed"):
+        return "Post-edit failed - single tap inserts raw text, tap + modifier retries edit, double tap opens review"
+    if draft.get("post_edit"):
+        return "Edited preview ready - tap hotkey to insert, double-tap to review"
+    return "Preview ready - tap hotkey to insert, double-tap to edit"
+
+
+def _update_preview_from_draft(draft: dict, *, loading: bool | None = None):
+    _show_preview_overlay(
+        text=draft.get("text", ""),
+        editor_notes=draft.get("editor_notes", ""),
+        status=_current_draft_status(draft),
+        profile=draft.get("profile", "main"),
+        post_edit=draft.get("post_edit_profile", "") if draft.get("post_edit") else "",
+        loading=bool(draft.get("edit_in_progress")) if loading is None else loading,
+    )
+
+
+def _insert_pending_draft(config: dict, include_notes: bool = False) -> bool:
+    draft = _peek_pending_draft()
+    if not draft:
+        return False
+    if draft.get("edit_in_progress"):
+        print("[DRAFT] Post-edit still running; insert is not available yet.", flush=True)
+        return False
+    text = (draft.get("text") or "").strip()
+    if not text:
+        _clear_pending_draft()
+        return False
+    notes = (draft.get("editor_notes") or "").strip()
+    if include_notes and notes:
+        text = f"{text}\n\nEditor notes:\n{notes}".strip()
+    if not is_text_input_focused():
+        print("[DRAFT] Focused control is not a text input; keeping preview open.", flush=True)
+        return False
+    insert_mode = choose_insert_mode()
+    print(f"[DRAFT] Inserting preview via {insert_mode}{' with editor notes' if include_notes and notes else ''}.", flush=True)
+    _release_possible_modifiers()
+    if insert_mode == "type":
+        type_text(text, char_delay=config.get("char_delay", 0.0))
+    else:
+        paste_text(text, method=insert_mode, source="draft_insert")
+    _last_typed[0] = text
+    _clear_pending_draft()
+    return True
+
+
+def _start_pending_draft_post_edit(config_getter) -> bool:
+    draft = _peek_pending_draft()
+    if not draft:
+        return False
+    if draft.get("post_edit"):
+        return False
+    if draft.get("edit_in_progress"):
+        print("[DRAFT] Post-edit already running for the preview.", flush=True)
+        return True
+    source_text = (draft.get("text") or "").strip()
+    if not source_text:
+        return False
+    edit_profile = _post_edit_profile_name(draft.get("post_edit_profile")) or POST_EDIT_PROFILES[0]
+
+    with _draft_lock:
+        if not _pending_draft["active"]:
+            return False
+        _pending_draft["edit_in_progress"] = True
+        draft = dict(_pending_draft)
+    _update_preview_from_draft(draft, loading=True)
+    print("[DRAFT] Starting on-demand edit pass for the preview.", flush=True)
+
+    def _go():
+        cfg = config_getter()
+        edited_text, editor_notes, success = _post_edit_text(source_text, cfg, draft.get("profile", "main"), edit_profile)
+        with _draft_lock:
+            if not _pending_draft["active"]:
+                return
+            _pending_draft["text"] = (edited_text or source_text).strip() or source_text
+            _pending_draft["editor_notes"] = (editor_notes or "").strip()
+            _pending_draft["post_edit"] = bool(success)
+            _pending_draft["post_edit_profile"] = edit_profile if success else ""
+            _pending_draft["post_edit_failed"] = not bool(success)
+            _pending_draft["edit_in_progress"] = False
+            updated = dict(_pending_draft)
+        _update_preview_from_draft(updated, loading=False)
+        if success:
+            print("[DRAFT] On-demand edit pass complete.", flush=True)
+        else:
+            print("[DRAFT] On-demand edit pass failed; preview kept for retry or raw insert.", flush=True)
+
+    threading.Thread(target=_go, daemon=True).start()
+    return True
+
+
+def _schedule_pending_draft_insert(config_getter):
+    stamp = time.time()
+    with _draft_tap_lock:
+        _draft_tap_state["stamp"] = stamp
+        _draft_tap_state["include_notes"] = False
+
+    def _go(local_stamp=stamp):
+        time.sleep(_DRAFT_SINGLE_TAP_DELAY)
+        with _draft_tap_lock:
+            if _draft_tap_state["stamp"] != local_stamp:
+                return
+            include_notes = bool(_draft_tap_state["include_notes"])
+            _draft_tap_state["stamp"] = 0.0
+            _draft_tap_state["include_notes"] = False
+        cfg = config_getter()
+        include_notes = include_notes or _wait_for_notes_insert_request(cfg)
+        latest_draft = _peek_pending_draft()
+        if include_notes and latest_draft and not latest_draft.get("post_edit"):
+            print("[DRAFT] Modifier tap requested edit pass before insertion.", flush=True)
+            _start_pending_draft_post_edit(config_getter)
+            return
+        _insert_pending_draft(cfg, include_notes=include_notes)
+
+    threading.Thread(target=_go, daemon=True).start()
+
+
+def _register_pending_draft_tap(config_getter) -> str:
+    now = time.time()
+    cfg = config_getter()
+    toggle_key = _post_edit_toggle_key(cfg)
+    saw_toggle = False
+    if toggle_key:
+        try:
+            saw_toggle = keyboard.is_pressed(toggle_key)
+        except Exception:
+            saw_toggle = False
+    with _draft_tap_lock:
+        last = _draft_tap_state["stamp"]
+        if saw_toggle:
+            _draft_tap_state["include_notes"] = True
+        if last and (now - last) <= _DRAFT_DOUBLE_TAP_GAP:
+            _draft_tap_state["stamp"] = 0.0
+            include_notes = bool(_draft_tap_state["include_notes"])
+            _draft_tap_state["include_notes"] = False
+            return "insert_notes" if include_notes else "double"
+    _schedule_pending_draft_insert(config_getter)
+    return "wait"
+
+
+def _ensure_preview_overlay():
+    if _preview_overlay_started[0]:
+        return
+    _preview_overlay_started[0] = True
+    threading.Thread(target=_preview_overlay_main, daemon=True).start()
+
+
+def _preview_overlay_main():
+    import tkinter as tk
+
+    root = tk.Tk()
+    root.withdraw()
+
+    preview = tk.Toplevel(root)
+    preview.overrideredirect(True)
+    preview.wm_attributes("-topmost", True)
+    preview.wm_attributes("-alpha", 0.96)
+    preview.configure(bg="#0f172a")
+
+    frame = tk.Frame(preview, bg="#0f172a", bd=2, relief="solid", highlightthickness=0)
+    frame.pack(fill="both", expand=True)
+
+    header = tk.Frame(frame, bg="#0f172a")
+    header.pack(fill="x", padx=12, pady=(10, 6))
+    title_var = tk.StringVar(value="Dictation")
+    status_var = tk.StringVar(value="")
+    body_var = tk.StringVar(value="")
+    notes_var = tk.StringVar(value="")
+    badge_var = tk.StringVar(value="")
+    spinner_frames = ["|", "/", "-", "\\"]
+    tick = [0]
+
+    tk.Label(header, textvariable=title_var, bg="#0f172a", fg="#e2e8f0", font=("Segoe UI", 12, "bold")).pack(side="left")
+    tk.Label(header, textvariable=badge_var, bg="#0f172a", fg="#93c5fd", font=("Segoe UI", 10, "bold")).pack(side="right")
+    tk.Label(frame, textvariable=status_var, bg="#0f172a", fg="#cbd5e1", justify="left", anchor="w", wraplength=520, font=("Segoe UI", 10)).pack(fill="x", padx=12)
+    body_label = tk.Label(
+        frame,
+        textvariable=body_var,
+        bg="#0f172a",
+        fg="#f8fafc",
+        justify="left",
+        anchor="nw",
+        wraplength=520,
+        font=("Segoe UI", 13),
+    )
+    body_label.pack(fill="both", expand=True, padx=12, pady=(8, 12))
+    notes_title = tk.Label(frame, text="Editor notes", bg="#0f172a", fg="#bfdbfe", justify="left", anchor="w", font=("Segoe UI", 10, "bold"))
+    notes_body = tk.Label(
+        frame,
+        textvariable=notes_var,
+        bg="#0f172a",
+        fg="#cbd5e1",
+        justify="left",
+        anchor="nw",
+        wraplength=560,
+        font=("Segoe UI", 10),
+    )
+
+    review = tk.Toplevel(root)
+    review.title("Dictation Review")
+    review.geometry("760x420")
+    review.withdraw()
+    review.columnconfigure(0, weight=1)
+    review.rowconfigure(0, weight=1)
+    review_text = tk.Text(review, wrap="word", font=("Segoe UI", 11))
+    review_text.grid(row=0, column=0, sticky="nsew", padx=10, pady=(10, 6))
+    review_scroll = tk.Scrollbar(review, orient="vertical", command=review_text.yview)
+    review_scroll.grid(row=0, column=1, sticky="ns", pady=(10, 6))
+    review_text.configure(yscrollcommand=review_scroll.set)
+    review_status = tk.Label(review, text="Review and copy manually if you want to paste later.", anchor="w")
+    review_status.grid(row=1, column=0, sticky="ew", padx=10)
+    review_btns = tk.Frame(review)
+    review_btns.grid(row=2, column=0, columnspan=2, sticky="e", padx=10, pady=(8, 10))
+
+    def _copy_review():
+        _draft_review_copy_text(review_text.get("1.0", "end-1c"))
+        _clear_pending_draft()
+
+    def _close_review():
+        _set_pending_draft_review(False)
+
+    tk.Button(review_btns, text="Copy", command=_copy_review, width=10).pack(side="left", padx=(0, 6))
+    tk.Button(review_btns, text="Close", command=_close_review, width=10).pack(side="left")
+    review.protocol("WM_DELETE_WINDOW", _close_review)
+
+    def _position_preview(width: int, height: int):
+        # Use Tk's pointer coordinates for Tk geometry. Mixing Win32 physical
+        # cursor coordinates with Tk-scaled window coordinates drifts badly on
+        # mixed-DPI monitor setups.
+        try:
+            x, y = preview.winfo_pointerxy()
+        except Exception:
+            x, y = _cursor_pos()
+
+        try:
+            work_left = preview.winfo_vrootx()
+            work_top = preview.winfo_vrooty()
+            work_right = work_left + preview.winfo_vrootwidth()
+            work_bottom = work_top + preview.winfo_vrootheight()
+        except Exception:
+            work_left = 0
+            work_top = 0
+            work_right = preview.winfo_screenwidth()
+            work_bottom = preview.winfo_screenheight()
+
+        offset_x = 24
+        offset_y = 24
+        margin = 8
+
+        px = x + offset_x
+        py = y + offset_y
+        if px + width > work_right - margin:
+            px = x - width - offset_x
+        if py + height > work_bottom - margin:
+            py = y - height - offset_y
+
+        px = min(max(px, work_left + margin), max(work_left + margin, work_right - width - margin))
+        py = min(max(py, work_top + margin), max(work_top + margin, work_bottom - height - margin))
+        preview.geometry(f"{int(width)}x{int(height)}+{int(px)}+{int(py)}")
+
+    def _poll():
+        tick[0] += 1
+        with _preview_overlay_lock:
+            st = dict(_preview_overlay_state)
+        cfg = _current_config[0] if _current_config and _current_config[0] else DEFAULT_CONFIG
+        max_preview_width = max(500, int(cfg.get("preview_max_width", DEFAULT_CONFIG["preview_max_width"])))
+        max_preview_height = max(220, int(cfg.get("preview_max_height", DEFAULT_CONFIG["preview_max_height"])))
+        draft = _peek_pending_draft()
+        review_open = bool(draft and draft.get("review_open"))
+        if review_open:
+            wanted = draft.get("text") or ""
+            notes = (draft.get("editor_notes") or "").strip()
+            if notes:
+                wanted = f"{wanted}\n\nEditor notes:\n{notes}".strip()
+            current = review_text.get("1.0", "end-1c")
+            if current != wanted:
+                review_text.delete("1.0", "end")
+                review_text.insert("1.0", wanted)
+            if not review.winfo_viewable():
+                review.deiconify()
+                review.lift()
+                review.focus_force()
+        elif review.winfo_viewable():
+            review.withdraw()
+
+        if st.get("visible") and not review_open:
+            profile = st.get("profile") or "main"
+            post_edit_profile = _post_edit_profile_name(st.get("post_edit"))
+            title_var.set("Fast Dictation" if profile == "fast" else "Dictation")
+            badge_var.set(f"EDIT {post_edit_profile.upper()}" if post_edit_profile else "EDIT OFF")
+            status = st.get("status") or ""
+            if st.get("loading"):
+                status = f"{status} {spinner_frames[tick[0] % len(spinner_frames)]}".strip()
+            status_var.set(status)
+            body_var.set(st.get("text") or "Listening...")
+            notes_value = (st.get("editor_notes") or "").strip()
+            notes_var.set(notes_value)
+            if notes_value:
+                if not notes_title.winfo_ismapped():
+                    notes_title.pack(fill="x", padx=12, pady=(0, 2))
+                    notes_body.pack(fill="x", padx=12, pady=(0, 12))
+            else:
+                if notes_title.winfo_ismapped():
+                    notes_title.pack_forget()
+                    notes_body.pack_forget()
+            body_label.configure(wraplength=560)
+            preview.update_idletasks()
+            width = max(500, min(max_preview_width, frame.winfo_reqwidth() + 4))
+            height = max(220, min(max_preview_height, frame.winfo_reqheight() + 4))
+            _position_preview(width, height)
+            if not preview.winfo_viewable():
+                preview.deiconify()
+                preview.lift()
+        elif preview.winfo_viewable():
+            preview.withdraw()
+        root.after(50, _poll)
+
+    root.after(0, lambda: _apply_noactivate(preview.winfo_id()))
+    root.after(50, _poll)
+    root.mainloop()
+
+
+def _hotkey_is_down_now(hotkey_name: str, config: dict) -> bool:
+    if _native_hotkeys is not None:
+        return _native_hotkeys.is_pressed(hotkey_name)
+    hotkey_text = config.get("fast_hotkey") if hotkey_name == "fast_ptt" else config.get("hotkey")
+    try:
+        return keyboard.is_pressed(hotkey_text)
+    except Exception:
+        return False
 
 
 def reinsert_last_transcription():
     """Insert the last transcription again using the current focused-field strategy."""
-    text = _last_typed[0]
+    text = _last_result_text[0] or _last_typed[0] or _latest_history_text()
     if not text:
         print("[REINSERT] No last transcription available.", flush=True)
         return
@@ -1016,7 +2502,7 @@ def reinsert_last_transcription():
     if insert_mode == "type":
         type_text(text)
     else:
-        paste_text(text, method=insert_mode)
+        paste_text(text, method=insert_mode, source="last_result_reinsert")
 
 
 # ── Live-mode overlay indicator ───────────────────────────────────────────────
@@ -1028,6 +2514,7 @@ _OVL_RECORDING    = 1
 _OVL_TRANSCRIBING = 2
 _OVL_FAST_RECORDING    = 3
 _OVL_FAST_TRANSCRIBING = 4
+_OVL_EDITOR_NOTES = 5
 
 _overlay_state   = [_OVL_IDLE]
 _overlay_started = [False]
@@ -1072,6 +2559,8 @@ def _overlay_main():
 
     SIZE   = 22   # overlay canvas size in pixels
     OFFSET = 18   # distance from cursor tip to dot centre
+    NOTE_W = 360
+    NOTE_H = 180
 
     # Initial off-screen placement; real position set on first show.
     win.geometry(f"{SIZE}x{SIZE}+-100+-100")
@@ -1084,6 +2573,11 @@ def _overlay_main():
     canvas = tk.Canvas(win, width=SIZE, height=SIZE, bg=TRANSPARENT,
                        highlightthickness=0)
     canvas.pack(fill="both", expand=True)
+    note_bg = canvas.create_rectangle(0, 0, 0, 0, fill="#0f172a", outline="#334155", width=2)
+    note_title = canvas.create_text(0, 0, text="", anchor="nw", fill="#bfdbfe", font=("Segoe UI", 12, "bold"))
+    note_text = canvas.create_text(0, 0, text="", anchor="nw", fill="#e2e8f0", width=NOTE_W - 28, font=("Segoe UI", 11))
+    note_bar_bg = canvas.create_rectangle(0, 0, 0, 0, fill="#1e293b", outline="", width=0)
+    note_bar_fg = canvas.create_rectangle(0, 0, 0, 0, fill="#38bdf8", outline="", width=0)
     halo = canvas.create_polygon(0, 0, 0, 0, 0, 0, 0, 0,
                                  fill="", outline="", width=0, smooth=False)
     dot = canvas.create_oval(4, 4, SIZE - 4, SIZE - 4,
@@ -1100,6 +2594,15 @@ def _overlay_main():
     }
     _FAST_STATES = {_OVL_FAST_RECORDING, _OVL_FAST_TRANSCRIBING}
 
+    def _hide_notes():
+        canvas.coords(note_bg, 0, 0, 0, 0)
+        canvas.coords(note_title, 0, 0)
+        canvas.itemconfig(note_title, text="")
+        canvas.coords(note_text, 0, 0)
+        canvas.itemconfig(note_text, text="")
+        canvas.coords(note_bar_bg, 0, 0, 0, 0)
+        canvas.coords(note_bar_fg, 0, 0, 0, 0)
+
     def _set_halo(radius: int, color: str, width: int):
         cx = SIZE // 2
         cy = SIZE // 2
@@ -1115,22 +2618,51 @@ def _overlay_main():
     def _poll():
         state = _overlay_state[0]
         _tick[0] += 1
+        note_text_value = None
+        note_ratio = 0.0
+        if state == _OVL_EDITOR_NOTES:
+            with _editor_notes_lock:
+                note_text_value = (_pending_editor_notes.get("text") or "").strip()
+                expires_at = float(_pending_editor_notes.get("expires_at") or 0.0)
+                duration = max(0.1, float(_pending_editor_notes.get("duration") or 0.0))
+            remaining = expires_at - time.time()
+            if not note_text_value or remaining <= 0:
+                _clear_pending_editor_notes()
+                state = _overlay_state[0]
+            else:
+                note_ratio = max(0.0, min(1.0, remaining / duration))
         if state != _prev[0]:
             _prev[0] = state
             if state == _OVL_IDLE:
                 win.withdraw()
             else:
-                # Move to cursor position + small offset so the dot sits just
-                # below and to the right of the cursor tip without obscuring it.
                 cx, cy = _overlay_pos[0], _overlay_pos[1]
-                win.geometry(f"{SIZE}x{SIZE}+{cx + OFFSET}+{cy + OFFSET}")
-                canvas.itemconfig(dot, fill=_COLORS[state])
+                if state == _OVL_EDITOR_NOTES:
+                    win.geometry(f"{NOTE_W}x{NOTE_H}+{cx + OFFSET}+{cy + OFFSET}")
+                    canvas.config(width=NOTE_W, height=NOTE_H)
+                else:
+                    win.geometry(f"{SIZE}x{SIZE}+{cx + OFFSET}+{cy + OFFSET}")
+                    canvas.config(width=SIZE, height=SIZE)
+                    canvas.itemconfig(dot, fill=_COLORS[state])
                 win.deiconify()
                 win.lift()
+        if state == _OVL_EDITOR_NOTES:
+            canvas.coords(note_bg, 4, 4, NOTE_W - 4, NOTE_H - 4)
+            canvas.coords(note_title, 14, 12)
+            canvas.itemconfig(note_title, text="Editor notes")
+            canvas.coords(note_text, 14, 40)
+            canvas.itemconfig(note_text, text=note_text_value)
+            canvas.coords(note_bar_bg, 14, NOTE_H - 18, NOTE_W - 14, NOTE_H - 10)
+            canvas.coords(note_bar_fg, 14, NOTE_H - 18, 14 + int((NOTE_W - 28) * note_ratio), NOTE_H - 10)
+            canvas.itemconfig(halo, outline="", width=0)
+            canvas.coords(dot, 0, 0, 0, 0)
+        else:
+            _hide_notes()
+            canvas.coords(dot, 4, 4, SIZE - 4, SIZE - 4)
         if state in _FAST_STATES:
             pulse = 8 + (_tick[0] % 6) // 2
             _set_halo(radius=pulse, color=_COLORS[state], width=2)
-        else:
+        elif state != _OVL_EDITOR_NOTES:
             canvas.itemconfig(halo, outline="", width=0)
         win.after(50, _poll)
 
@@ -1191,33 +2723,63 @@ def _is_hallucination(text: str) -> bool:
     return False
 
 
+def _strip_boundary_ellipsis(text: str) -> str:
+    """Remove model-added continuation ellipses from chunk and final boundaries."""
+    cleaned = (text or "").strip()
+    while True:
+        stripped = cleaned.rstrip()
+        if stripped.endswith("..."):
+            cleaned = stripped[:-3].rstrip()
+            continue
+        if stripped.endswith("…"):
+            cleaned = stripped[:-1].rstrip()
+            continue
+        return stripped
+
+
 def _join_chunks(texts: list[str]) -> str:
     """Join VAD chunk transcriptions into a single string.
 
     Parakeet adds terminal punctuation to every chunk it sees as a complete
     sentence.  When the VAD cuts mid-sentence the result looks like:
         "I was trying to explain. something important."
-    Heuristic: if chunk[N] ends with '.' and chunk[N+1] starts with a
-    lowercase letter, the period was added by the model at an artificial
-    boundary — strip it so the joined text reads naturally.
+    Heuristic: if chunk[N] ends with '.' / '...' / '…' and chunk[N+1] starts
+    with a lowercase letter, digit, or opening bracket/quote, that ending was
+    likely added by the model at an artificial boundary — strip it so the
+    joined text reads naturally.
     Other punctuation (! ? , ; :) is never stripped automatically.
     """
     cleaned: list[str] = []
     for i, text in enumerate(texts):
-        text = text.strip()
+        text = _strip_boundary_ellipsis(text)
         if not text:
             continue
         # Look ahead: if the next non-empty chunk starts with lowercase,
-        # this chunk's trailing period is likely spurious.
-        if text.endswith("."):
-            next_text = next((t.strip() for t in texts[i + 1:] if t.strip()), "")
-            if next_text and next_text[0].islower():
-                text = text[:-1]  # drop the period
+        # digit, or an opener, this chunk's trailing punctuation is likely
+        # spurious chunk-boundary punctuation.
+        next_text = next((t.strip() for t in texts[i + 1:] if t.strip()), "")
+        if next_text and (
+            next_text[0].islower()
+            or next_text[0].isdigit()
+            or next_text[0] in "([{\"'`"
+        ):
+            if text.endswith("..."):
+                text = text[:-3].rstrip()
+            elif text.endswith("…"):
+                text = text[:-1].rstrip()
+            elif text.endswith("."):
+                text = text[:-1].rstrip()
         cleaned.append(text)
-    return " ".join(cleaned)
+    return _strip_boundary_ellipsis(" ".join(cleaned))
 
 
-def run_session(config: dict, insert_mode: str = "type", profile: str = "main", hotkey_name: str = "ptt"):
+def run_session(
+    config: dict,
+    insert_mode: str = "type",
+    profile: str = "main",
+    hotkey_name: str = "ptt",
+    on_post_edit_change=None,
+):
     """Full push-to-talk cycle: record → transcribe → type.  Runs in a thread."""
     if not _session_lock.acquire(blocking=False):
         print("[SESSION] Already recording, ignoring trigger.", flush=True)
@@ -1280,9 +2842,203 @@ def run_session(config: dict, insert_mode: str = "type", profile: str = "main", 
         t.start()
         return stop, t
 
-    live_cfg, simple_cfg = session_mode_settings(config, insert_mode, profile)
+    mode_name, simple_cfg = session_mode_settings(config, insert_mode, profile)
+    live_cfg = mode_name == "live"
+    post_edit_active = _post_edit_enabled(config, profile, live_cfg)
+    live = live_cfg and insert_mode == "type"
+    _begin_audio_ducking(config)
+
+    if mode_name == "preview" or (not live and mode_name != "classic"):
+        preview_text = [""]
+        preview_status = ["Listening"]
+        preview_post_edit = [post_edit_active]
+
+        def _apply_post_edit_state(enabled):
+            preview_post_edit[0] = _post_edit_profile_name(enabled)
+            if on_post_edit_change:
+                try:
+                    on_post_edit_change(preview_post_edit[0])
+                except Exception:
+                    pass
+            _show_preview_overlay(
+                text=preview_text[0],
+                editor_notes=((_peek_pending_draft() or {}).get("editor_notes", "")),
+                status=preview_status[0],
+                profile=profile,
+                post_edit=preview_post_edit[0],
+                loading=False,
+            )
+
+        def _set_preview(status: str | None = None, text: str | None = None, *, loading: bool = False):
+            if status is not None:
+                preview_status[0] = status
+            if text is not None:
+                preview_text[0] = text
+            _show_preview_overlay(
+                text=preview_text[0],
+                editor_notes=((_peek_pending_draft() or {}).get("editor_notes", "")),
+                status=preview_status[0],
+                profile=profile,
+                post_edit=preview_post_edit[0],
+                loading=loading,
+            )
+
+        _apply_post_edit_state(post_edit_active)
+
+        try:
+            time.sleep(config.get("pre_type_delay", 0.05))
+            chunk_results: dict[int, str] = {}
+            chunk_lock = threading.Lock()
+            _set_preview("Listening", "")
+            print("[STATUS] Listening (preview)", flush=True)
+
+            def _on_classic_chunk(chunk_index: int, result: tuple):
+                text_value, error_value = result
+                if error_value or not text_value or _is_hallucination(text_value):
+                    return
+                with chunk_lock:
+                    chunk_results[chunk_index] = text_value
+                    ordered = [chunk_results[i] for i in sorted(chunk_results)]
+                _set_preview(text=_join_chunks(ordered))
+
+            full_audio, pending, remaining, post_edit_active = _record_with_vad(
+                config,
+                on_chunk_ready=_on_classic_chunk,
+                hotkey_name=hotkey_name,
+                post_edit_active=post_edit_active,
+                on_post_edit_toggle=_apply_post_edit_state,
+                insert_mode=insert_mode,
+            )
+
+            if full_audio is None:
+                _hide_preview_overlay()
+                return
+
+            _set_preview("Transcribing", preview_text[0], loading=True)
+            print("[STATUS] Transcribing (preview)", flush=True)
+
+            if remaining is not None:
+                h: list = []
+                ev = threading.Event()
+
+                def _go(a=remaining):
+                    h.append(transcribe(a, config))
+                    ev.set()
+
+                threading.Thread(target=_go, daemon=True).start()
+                pending.append((h, ev))
+                print(
+                    f"[VAD] Final chunk sent ({len(remaining)/config.get('sample_rate',16000):.2f}s)",
+                    flush=True,
+                )
+
+            texts: list[str] = []
+            errors: list[str] = []
+            for i, (holder, ev) in enumerate(pending):
+                ev.wait(timeout=65)
+                if holder:
+                    t, e = holder[0]
+                    if t:
+                        if _is_hallucination(t):
+                            print(f"[VAD] Chunk {i+1} discarded (hallucination): {t!r}", flush=True)
+                        else:
+                            texts.append(t)
+                            print(f"[VAD] Chunk {i+1} -> {t!r}", flush=True)
+                    elif e:
+                        errors.append(e)
+                        print(f"[VAD] Chunk {i+1} error: {e}", flush=True)
+
+            result = _join_chunks(texts) if texts else None
+            error = errors[0] if errors and not texts else None
+            editor_notes = ""
+            post_edit_success = False
+
+            if result:
+                _set_preview(text=result)
+            if result and post_edit_active and not live_cfg:
+                _set_preview("Post-editing", result, loading=True)
+                result, editor_notes, post_edit_success = _post_edit_text(result, config, profile, post_edit_active)
+
+            review_non_post_edit = bool(
+                config.get(
+                    "fast_review_non_post_edit_sessions" if profile == "fast" else "main_review_non_post_edit_sessions",
+                    False,
+                )
+            )
+            auto_insert_without_post_edit = not review_non_post_edit
+
+            if result:
+                _set_last_result_text(result)
+                _add_to_history({
+                    "time": _now_str(),
+                    "text": result,
+                    "editor_notes": editor_notes,
+                    "post_edit_active": bool(post_edit_success and post_edit_active and not live_cfg),
+                    "post_edit_profile": post_edit_active if post_edit_success and post_edit_active and not live_cfg else "",
+                })
+                should_hold_preview = bool(post_edit_active) or not auto_insert_without_post_edit
+                if should_hold_preview:
+                    _set_pending_draft(
+                        result,
+                        profile=profile,
+                        post_edit=(post_edit_active if post_edit_success else ""),
+                        editor_notes=editor_notes,
+                        post_edit_failed=bool(post_edit_active and not post_edit_success),
+                    )
+                    print("[DRAFT] Preview ready and waiting for hotkey tap.", flush=True)
+                else:
+                    cls = focused_class()
+                    if not is_text_input_focused():
+                        print(
+                            f"[TYPE] Skipped — focused element is not a text input (class: {cls!r}). Text saved to history.",
+                            flush=True,
+                        )
+                        _hide_preview_overlay()
+                    else:
+                        action = {
+                            "type": "Typing",
+                            "paste_ctrl_v": "Pasting (Ctrl+V)",
+                            "paste_right_click": "Pasting (right click)",
+                        }.get(insert_mode, "Typing")
+                        print(f"[TYPE] {action} {len(result)} chars into {cls!r}", flush=True)
+                        _last_typed[0] = ""
+                        if insert_mode in {"paste_ctrl_v", "paste_right_click"}:
+                            paste_text(result, method=insert_mode, source=f"{profile}_result")
+                        else:
+                            type_text(result, char_delay=config.get("char_delay", 0.0))
+                        _last_typed[0] = result
+                        if editor_notes:
+                            _show_pending_editor_notes(
+                                editor_notes,
+                                duration=_editor_notes_overlay_duration(editor_notes, config),
+                            )
+                        _hide_preview_overlay()
+                        print("[TYPE] Done.", flush=True)
+            elif error:
+                history_entry = {"time": _now_str(), "text": None, "error": error}
+                if _should_save_failed_wav(error):
+                    wav_path = _save_failed_wav(full_audio, config.get("sample_rate", 16000))
+                    history_entry["wav"] = str(wav_path)
+                _add_to_history(history_entry)
+                _hide_preview_overlay()
+                print(f"[TYPE] Error — typing message for 5 s: {error!r}", flush=True)
+                type_text(error)
+                time.sleep(5)
+                delete_chars(len(error))
+            else:
+                _hide_preview_overlay()
+                print("[TYPE] Empty result — nothing typed.", flush=True)
+            return
+        finally:
+            _end_audio_ducking()
+            _session_lock.release()
+
+    if on_post_edit_change:
+        try:
+            on_post_edit_change(post_edit_active)
+        except Exception:
+            pass
     fancy = not simple_cfg
-    live  = live_cfg and insert_mode == "type"
     inline_status = (
         insert_mode == "type"
         or profile == "fast"
@@ -1299,13 +3055,6 @@ def run_session(config: dict, insert_mode: str = "type", profile: str = "main", 
         # ════════════════════════════════════════════════════════════════════
         if not live:
             time.sleep(config.get("pre_type_delay", 0.05))
-            if inline_status:
-                # The listening animation starts while the hotkey is still held.
-                # Give Windows and the target app a brief chance to clear any
-                # logically depressed modifiers before we start replace-in-place
-                # backspace updates.
-                _release_possible_modifiers()
-                time.sleep(0.03)
             if overlay_status:
                 _ensure_overlay()
                 _set_overlay(overlay_recording)
@@ -1326,7 +3075,13 @@ def run_session(config: dict, insert_mode: str = "type", profile: str = "main", 
             else:
                 print("[STATUS] Listening", flush=True)
 
-            full_audio, pending, remaining = _record_with_vad(config, hotkey_name=hotkey_name)
+            full_audio, pending, remaining, post_edit_active = _record_with_vad(
+                config,
+                hotkey_name=hotkey_name,
+                post_edit_active=post_edit_active,
+                on_post_edit_toggle=(None if live else on_post_edit_change),
+                insert_mode=insert_mode,
+            )
 
             if inline_status and fancy:
                 stop_listen.set()
@@ -1391,17 +3146,32 @@ def run_session(config: dict, insert_mode: str = "type", profile: str = "main", 
             result = _join_chunks(texts) if texts else None
             error  = errors[0] if errors and not texts else None
 
+            editor_notes = ""
+            post_edit_success = False
+            if result and post_edit_active and not live_cfg:
+                result, editor_notes, post_edit_success = _post_edit_text(result, config, profile, post_edit_active)
+
             if inline_status and fancy:
                 stop_spin.set()
                 spin_thread.join(timeout=1.0)
             if inline_status:
                 _erase_status()
-                time.sleep(config.get("erase_delay", 0.08))
+                erase_delay = float(config.get("erase_delay", 0.08))
+                if insert_mode == "paste_right_click":
+                    erase_delay = max(erase_delay, 0.14)
+                time.sleep(erase_delay)
             if overlay_status:
                 _set_overlay(_OVL_IDLE)
 
             if result:
-                _add_to_history({"time": _now_str(), "text": result})
+                _set_last_result_text(result)
+                _add_to_history({
+                    "time": _now_str(),
+                    "text": result,
+                    "editor_notes": editor_notes,
+                    "post_edit_active": bool(post_edit_success and post_edit_active and not live_cfg),
+                    "post_edit_profile": post_edit_active if post_edit_success and post_edit_active and not live_cfg else "",
+                })
                 cls = focused_class()
                 if not is_text_input_focused():
                     print(f"[TYPE] Skipped — focused element is not a text input "
@@ -1415,15 +3185,22 @@ def run_session(config: dict, insert_mode: str = "type", profile: str = "main", 
                     print(f"[TYPE] {action} {len(result)} chars into {cls!r}", flush=True)
                     _last_typed[0] = ""
                     if insert_mode in {"paste_ctrl_v", "paste_right_click"}:
-                        paste_text(result, method=insert_mode)
+                        paste_text(result, method=insert_mode, source=f"{profile}_result")
                     else:
                         type_text(result, char_delay=config.get("char_delay", 0.0))
                     _last_typed[0] = result
+                    if editor_notes:
+                        _show_pending_editor_notes(
+                            editor_notes,
+                            duration=_editor_notes_overlay_duration(editor_notes, config),
+                        )
                     print("[TYPE] Done.", flush=True)
             elif error:
-                wav_path = _save_failed_wav(full_audio, config.get("sample_rate", 16000))
-                _add_to_history({"time": _now_str(), "text": None,
-                                 "error": error, "wav": str(wav_path)})
+                history_entry = {"time": _now_str(), "text": None, "error": error}
+                if _should_save_failed_wav(error):
+                    wav_path = _save_failed_wav(full_audio, config.get("sample_rate", 16000))
+                    history_entry["wav"] = str(wav_path)
+                _add_to_history(history_entry)
                 print(f"[TYPE] Error — typing message for 5 s: {error!r}", flush=True)
                 type_text(error)
                 time.sleep(5)
@@ -1478,8 +3255,14 @@ def run_session(config: dict, insert_mode: str = "type", profile: str = "main", 
             _set_overlay(_OVL_RECORDING)
             print("[STATUS] Listening (live)", flush=True)
 
-            full_audio, pending, remaining = _record_with_vad(
-                config, on_chunk_ready=_on_chunk_during_hold, hotkey_name=hotkey_name)
+            full_audio, pending, remaining, _ = _record_with_vad(
+                config,
+                on_chunk_ready=_on_chunk_during_hold,
+                hotkey_name=hotkey_name,
+                post_edit_active=post_edit_active,
+                on_post_edit_toggle=None,
+                insert_mode=insert_mode,
+            )
 
             # Stop streaming callback
             with _stream_lock:
@@ -1552,7 +3335,13 @@ def run_session(config: dict, insert_mode: str = "type", profile: str = "main", 
                     field_content += to_type
 
             if full_result:
-                _add_to_history({"time": _now_str(), "text": full_result})
+                _set_last_result_text(full_result)
+                _add_to_history({
+                    "time": _now_str(),
+                    "text": full_result,
+                    "editor_notes": "",
+                    "post_edit_active": False,
+                })
                 if not focused:
                     print(f"[TYPE] Skipped — not a text input "
                           f"(class: {focused_cls!r}). Saved to history.", flush=True)
@@ -1561,9 +3350,11 @@ def run_session(config: dict, insert_mode: str = "type", profile: str = "main", 
                     print(f"[TYPE] Done — {len(field_content)} chars in "
                           f"{focused_cls!r}.", flush=True)
             elif error:
-                wav_path = _save_failed_wav(full_audio, config.get("sample_rate", 16000))
-                _add_to_history({"time": _now_str(), "text": None,
-                                 "error": error, "wav": str(wav_path)})
+                history_entry = {"time": _now_str(), "text": None, "error": error}
+                if _should_save_failed_wav(error):
+                    wav_path = _save_failed_wav(full_audio, config.get("sample_rate", 16000))
+                    history_entry["wav"] = str(wav_path)
+                _add_to_history(history_entry)
                 print(f"[TYPE] Error — typing message for 5 s: {error!r}", flush=True)
                 type_text(error)
                 time.sleep(5)
@@ -1572,6 +3363,7 @@ def run_session(config: dict, insert_mode: str = "type", profile: str = "main", 
                 print("[TYPE] Empty result — nothing typed.", flush=True)
 
     finally:
+        _end_audio_ducking()
         _session_lock.release()
 
 
@@ -1661,10 +3453,12 @@ def open_settings(config: dict, on_save_callback):
 
     MIC = tk.Frame(nb, padx=10, pady=8)  # Microphone tab
     S  = tk.Frame(nb, padx=10, pady=8)   # Advanced tab
+    LLM = tk.Frame(nb, padx=10, pady=8)  # LLM tab
     MT = tk.Frame(nb, padx=10, pady=8)   # Microphone Test tab
     IC = tk.Frame(nb, padx=10, pady=8)   # Input Classes tab
     nb.add(MIC, text="  Microphone  ")
     nb.add(S,  text="  Advanced  ")
+    nb.add(LLM, text="  LLM  ")
     nb.add(MT, text="  Microphone Test  ")
     nb.add(IC, text="  Input Classes  ")
 
@@ -1688,14 +3482,28 @@ def open_settings(config: dict, on_save_callback):
     # ════════════════════════════════════════════════════════════════════════
     S.columnconfigure(1, weight=1)
 
-    tk.Label(S, text="Server URL:").grid(row=0, column=0, sticky="e", **pad)
+    tk.Label(S, text="Backend:").grid(row=0, column=0, sticky="e", **pad)
+    transcription_backend_var = tk.StringVar(
+        master=win,
+        value=config.get("transcription_backend", DEFAULT_CONFIG["transcription_backend"]),
+    )
+    ttk.Combobox(
+        S,
+        textvariable=transcription_backend_var,
+        values=("http", "openai"),
+        width=18,
+        state="readonly",
+    ).grid(row=0, column=1, sticky="w", **pad)
+
+    tk.Label(S, text="Server URL:").grid(row=1, column=0, sticky="e", **pad)
     url_var = tk.StringVar(master=win, value=config["server_url"])
-    tk.Entry(S, textvariable=url_var, width=46).grid(row=0, column=1, columnspan=2, sticky="ew", **pad)
+    url_entry = tk.Entry(S, textvariable=url_var, width=46)
+    url_entry.grid(row=1, column=1, columnspan=2, sticky="ew", **pad)
 
     # Hotkey
-    tk.Label(S, text="Hotkey:").grid(row=1, column=0, sticky="e", **pad)
+    tk.Label(S, text="Hotkey:").grid(row=2, column=0, sticky="e", **pad)
     hotkey_frame = tk.Frame(S)
-    hotkey_frame.grid(row=1, column=1, columnspan=2, sticky="w", **pad)
+    hotkey_frame.grid(row=2, column=1, columnspan=2, sticky="w", **pad)
     hotkey_var = tk.StringVar(master=win, value=config["hotkey"])
     tk.Entry(hotkey_frame, textvariable=hotkey_var, width=28).pack(side="left")
     hotkey_status = tk.Label(hotkey_frame, text="", width=30, anchor="w")
@@ -1733,9 +3541,9 @@ def open_settings(config: dict, on_save_callback):
     _validate_current()
 
     # Fast paste hotkey
-    tk.Label(S, text="Fast hotkey:").grid(row=2, column=0, sticky="e", **pad)
+    tk.Label(S, text="Fast hotkey:").grid(row=3, column=0, sticky="e", **pad)
     fast_frame = tk.Frame(S)
-    fast_frame.grid(row=2, column=1, columnspan=2, sticky="w", **pad)
+    fast_frame.grid(row=3, column=1, columnspan=2, sticky="w", **pad)
     fast_var = tk.StringVar(master=win, value=config.get("fast_hotkey", ""))
     tk.Entry(fast_frame, textvariable=fast_var, width=28).pack(side="left")
     fast_status = tk.Label(fast_frame, text="", width=30, anchor="w")
@@ -1774,9 +3582,9 @@ def open_settings(config: dict, on_save_callback):
     _validate_fast()
 
     # Reinsert-last hotkey
-    tk.Label(S, text="Last result hotkey:").grid(row=3, column=0, sticky="e", **pad)
+    tk.Label(S, text="Last result hotkey:").grid(row=4, column=0, sticky="e", **pad)
     undo_frame = tk.Frame(S)
-    undo_frame.grid(row=3, column=1, columnspan=2, sticky="w", **pad)
+    undo_frame.grid(row=4, column=1, columnspan=2, sticky="w", **pad)
     undo_var = tk.StringVar(master=win, value=config.get("undo_hotkey", ""))
     tk.Entry(undo_frame, textvariable=undo_var, width=28).pack(side="left")
     undo_status = tk.Label(undo_frame, text="", width=30, anchor="w")
@@ -1844,14 +3652,14 @@ def open_settings(config: dict, on_save_callback):
     )
 
     # Language
-    tk.Label(S, text="Language (BCP-47):").grid(row=5, column=0, sticky="e", **pad)
+    tk.Label(S, text="Language (BCP-47):").grid(row=6, column=0, sticky="e", **pad)
     lang_var = tk.StringVar(master=win, value=config.get("language") or "")
-    tk.Entry(S, textvariable=lang_var, width=16).grid(row=5, column=1, sticky="w", **pad)
-    tk.Label(S, text="blank = auto", fg="grey").grid(row=5, column=2, sticky="w", **pad)
+    tk.Entry(S, textvariable=lang_var, width=16).grid(row=6, column=1, sticky="w", **pad)
+    tk.Label(S, text="blank = auto", fg="grey").grid(row=6, column=2, sticky="w", **pad)
 
     # ── VAD ───────────────────────────────────────────────────────────────────
     vad_frame = tk.LabelFrame(S, text=" Voice Activity Detection ", padx=8, pady=4)
-    vad_frame.grid(row=6, column=0, columnspan=3, sticky="ew", padx=2, pady=(6, 2))
+    vad_frame.grid(row=7, column=0, columnspan=3, sticky="ew", padx=2, pady=(6, 2))
     vad_frame.columnconfigure(1, weight=1)
 
     vpad = {"padx": 6, "pady": 3}
@@ -1886,52 +3694,301 @@ def open_settings(config: dict, on_save_callback):
     tk.Label(vad_frame, text="force-send after this many seconds regardless of silence",
              fg="grey").grid(row=4, column=2, sticky="w", **vpad)
 
-    # ── Animations ────────────────────────────────────────────────────────────
-    main_live_var   = tk.BooleanVar(master=win, value=bool(config.get("main_live_mode", config.get("live_mode", False))))
+    # ── Mode defaults ─────────────────────────────────────────────────────────
+    main_mode_var = tk.StringVar(master=win, value=config.get("main_mode", DEFAULT_CONFIG["main_mode"]))
     main_simple_var = tk.BooleanVar(master=win, value=bool(config.get("main_simple_mode", config.get("simple_mode", True))))
-    fast_live_var   = tk.BooleanVar(master=win, value=bool(config.get("fast_live_mode", config.get("live_mode", False))))
+    main_post_edit_var = tk.BooleanVar(master=win, value=bool(config.get("main_post_edit_mode", False)))
+    fast_mode_var = tk.StringVar(master=win, value=config.get("fast_mode", DEFAULT_CONFIG["fast_mode"]))
     fast_simple_var = tk.BooleanVar(master=win, value=bool(config.get("fast_simple_mode", config.get("simple_mode", True))))
-    live_var = main_live_var
-    simple_var = main_simple_var
-
-    live_cb = tk.Checkbutton(
-        S, text="Live transcription mode — stream each sentence as it arrives"
-                " (uses a screen overlay dot for status)",
-        variable=live_var, anchor="w",
+    fast_post_edit_var = tk.BooleanVar(master=win, value=bool(config.get("fast_post_edit_mode", False)))
+    main_review_non_post_edit_var = tk.BooleanVar(
+        master=win,
+        value=bool(config.get("main_review_non_post_edit_sessions", DEFAULT_CONFIG["main_review_non_post_edit_sessions"])),
     )
-    live_cb.grid(row=7, column=0, columnspan=3, sticky="w", padx=2, pady=(6, 0))
+    fast_review_non_post_edit_var = tk.BooleanVar(
+        master=win,
+        value=bool(config.get("fast_review_non_post_edit_sessions", DEFAULT_CONFIG["fast_review_non_post_edit_sessions"])),
+    )
+    normal_mode_frame = tk.LabelFrame(S, text=" Normal Hotkey ", padx=8, pady=4)
+    normal_mode_frame.grid(row=8, column=0, columnspan=3, sticky="ew", padx=2, pady=(6, 2))
+    normal_mode_frame.columnconfigure(0, weight=1)
+
+    tk.Label(normal_mode_frame, text="Mode:").grid(row=0, column=0, sticky="w", padx=4, pady=(2, 0))
+    ttk.Combobox(
+        normal_mode_frame,
+        textvariable=main_mode_var,
+        values=("classic", "preview", "live"),
+        width=14,
+        state="readonly",
+    ).grid(row=0, column=1, sticky="w", padx=(0, 4), pady=(2, 0))
 
     simple_cb = tk.Checkbutton(
-        S, text="    Simple mode — use plain ® / ¿ indicators instead of animations"
-                "  (SSH / terminal safe)   [classic mode only]",
-        variable=simple_var, anchor="w",
+        normal_mode_frame,
+        text="Simple mode — use plain ® / ¿ indicators instead of animations (SSH / terminal safe) [classic mode only]",
+        variable=main_simple_var,
+        anchor="w",
+        justify="left",
+        wraplength=500,
     )
-    simple_cb.grid(row=8, column=0, columnspan=3, sticky="w", padx=2, pady=(0, 2))
+    simple_cb.grid(row=1, column=0, columnspan=2, sticky="w", padx=4, pady=(0, 2))
+
+    main_post_edit_cb = tk.Checkbutton(
+        normal_mode_frame,
+        text="Start with post-edit enabled — send the final transcript through the LLM before insertion; you can toggle it during dictation with the key set in the LLM tab",
+        variable=main_post_edit_var,
+        anchor="w",
+        justify="left",
+        wraplength=500,
+    )
+    main_post_edit_cb.grid(row=2, column=0, columnspan=2, sticky="w", padx=4, pady=(0, 2))
+
+    main_review_non_post_edit_cb = tk.Checkbutton(
+        normal_mode_frame,
+        text="When post-edit is off, keep the floating preview open. Single tap inserts, single tap + modifier starts post-transcription edit, and double tap opens review. If off, non-post-edit results insert immediately on release.",
+        variable=main_review_non_post_edit_var,
+        anchor="w",
+        justify="left",
+        wraplength=500,
+    )
+    main_review_non_post_edit_cb.grid(row=3, column=0, columnspan=2, sticky="w", padx=4, pady=(0, 2))
 
     def _update_simple_state(*_):
-        state = "disabled" if live_var.get() else "normal"
-        simple_cb.config(state=state)
+        mode = main_mode_var.get().strip().lower()
+        simple_cb.grid_remove()
+        main_review_non_post_edit_cb.grid_remove()
+        main_post_edit_cb.grid_remove()
+        if mode == "classic":
+            simple_cb.grid()
+        elif mode == "preview":
+            main_review_non_post_edit_cb.grid()
 
-    live_var.trace_add("write", _update_simple_state)
-    _update_simple_state()   # set initial state
+    main_mode_var.trace_add("write", _update_simple_state)
+    _update_simple_state()
 
-    fast_live_cb = tk.Checkbutton(
-        S, text="Fast hotkey: live transcription mode",
-        variable=fast_live_var, anchor="w",
-    )
-    fast_live_cb.grid(row=9, column=0, columnspan=3, sticky="w", padx=2, pady=(8, 0))
+    fast_mode_frame = tk.LabelFrame(S, text=" Fast Hotkey ", padx=8, pady=4)
+    fast_mode_frame.grid(row=9, column=0, columnspan=3, sticky="ew", padx=2, pady=(6, 2))
+    fast_mode_frame.columnconfigure(0, weight=1)
+
+    tk.Label(fast_mode_frame, text="Mode:").grid(row=0, column=0, sticky="w", padx=4, pady=(2, 0))
+    ttk.Combobox(
+        fast_mode_frame,
+        textvariable=fast_mode_var,
+        values=("classic", "preview", "live"),
+        width=14,
+        state="readonly",
+    ).grid(row=0, column=1, sticky="w", padx=(0, 4), pady=(2, 0))
 
     fast_simple_cb = tk.Checkbutton(
-        S, text="    Fast hotkey: simple mode (classic mode only; live only applies on typed-input targets)",
-        variable=fast_simple_var, anchor="w",
+        fast_mode_frame,
+        text="Simple mode (classic mode only; live only applies on typed-input targets)",
+        variable=fast_simple_var,
+        anchor="w",
+        justify="left",
+        wraplength=500,
     )
-    fast_simple_cb.grid(row=10, column=0, columnspan=3, sticky="w", padx=2, pady=(0, 2))
+    fast_simple_cb.grid(row=1, column=0, columnspan=2, sticky="w", padx=4, pady=(0, 2))
+
+    fast_post_edit_cb = tk.Checkbutton(
+        fast_mode_frame,
+        text="Start with post-edit enabled — send the final transcript through the LLM before insertion; you can toggle it during dictation with the key set in the LLM tab",
+        variable=fast_post_edit_var,
+        anchor="w",
+        justify="left",
+        wraplength=500,
+    )
+    fast_post_edit_cb.grid(row=2, column=0, columnspan=2, sticky="w", padx=4, pady=(0, 2))
+
+    fast_review_non_post_edit_cb = tk.Checkbutton(
+        fast_mode_frame,
+        text="When post-edit is off, keep the floating preview open. Single tap inserts, single tap + modifier starts post-transcription edit, and double tap opens review. If off, non-post-edit results insert immediately on release.",
+        variable=fast_review_non_post_edit_var,
+        anchor="w",
+        justify="left",
+        wraplength=500,
+    )
+    fast_review_non_post_edit_cb.grid(row=3, column=0, columnspan=2, sticky="w", padx=4, pady=(0, 2))
 
     def _update_fast_simple_state(*_):
-        fast_simple_cb.config(state="disabled" if fast_live_var.get() else "normal")
+        mode = fast_mode_var.get().strip().lower()
+        fast_simple_cb.grid_remove()
+        fast_review_non_post_edit_cb.grid_remove()
+        fast_post_edit_cb.grid_remove()
+        if mode == "classic":
+            fast_simple_cb.grid()
+        elif mode == "preview":
+            fast_review_non_post_edit_cb.grid()
 
-    fast_live_var.trace_add("write", _update_fast_simple_state)
+    fast_mode_var.trace_add("write", _update_fast_simple_state)
     _update_fast_simple_state()
+
+    preview_size_frame = tk.LabelFrame(S, text=" Preview Window ", padx=8, pady=4)
+    preview_size_frame.grid(row=10, column=0, columnspan=3, sticky="ew", padx=2, pady=(6, 2))
+    preview_size_frame.columnconfigure(1, weight=1)
+
+    tk.Label(preview_size_frame, text="Max width:").grid(row=0, column=0, sticky="e", **vpad)
+    preview_max_width_var = tk.StringVar(
+        master=win,
+        value=str(config.get("preview_max_width", DEFAULT_CONFIG["preview_max_width"])),
+    )
+    tk.Entry(preview_size_frame, textvariable=preview_max_width_var, width=8).grid(row=0, column=1, sticky="w", **vpad)
+    tk.Label(preview_size_frame, text="pixels", fg="grey").grid(row=0, column=2, sticky="w", **vpad)
+
+    tk.Label(preview_size_frame, text="Max height:").grid(row=1, column=0, sticky="e", **vpad)
+    preview_max_height_var = tk.StringVar(
+        master=win,
+        value=str(config.get("preview_max_height", DEFAULT_CONFIG["preview_max_height"])),
+    )
+    tk.Entry(preview_size_frame, textvariable=preview_max_height_var, width=8).grid(row=1, column=1, sticky="w", **vpad)
+    tk.Label(preview_size_frame, text="pixels", fg="grey").grid(row=1, column=2, sticky="w", **vpad)
+
+    duck_audio_var = tk.BooleanVar(
+        master=win,
+        value=bool(config.get("duck_audio_during_dictation", DEFAULT_CONFIG["duck_audio_during_dictation"])),
+    )
+    duck_audio_level_var = tk.StringVar(
+        master=win,
+        value=str(config.get("duck_audio_level_percent", DEFAULT_CONFIG["duck_audio_level_percent"])),
+    )
+
+    duck_audio_frame = tk.LabelFrame(S, text=" Audio Ducking ", padx=8, pady=4)
+    duck_audio_frame.grid(row=11, column=0, columnspan=3, sticky="ew", padx=2, pady=(6, 2))
+    duck_audio_frame.columnconfigure(1, weight=1)
+
+    duck_audio_cb = tk.Checkbutton(
+        duck_audio_frame,
+        text="Lower Windows output volume while dictating/transcribing, then restore it when the session ends",
+        variable=duck_audio_var,
+        anchor="w",
+        justify="left",
+        wraplength=500,
+    )
+    duck_audio_cb.grid(row=0, column=0, columnspan=3, sticky="w", padx=4, pady=(0, 4))
+
+    tk.Label(duck_audio_frame, text="Target volume:").grid(row=1, column=0, sticky="e", **vpad)
+    duck_audio_level_entry = tk.Entry(duck_audio_frame, textvariable=duck_audio_level_var, width=8)
+    duck_audio_level_entry.grid(row=1, column=1, sticky="w", **vpad)
+    tk.Label(duck_audio_frame, text="% of current Windows output volume", fg="grey").grid(row=1, column=2, sticky="w", **vpad)
+
+    def _update_duck_audio_state(*_):
+        duck_audio_level_entry.config(state=("normal" if duck_audio_var.get() else "disabled"))
+
+    duck_audio_var.trace_add("write", _update_duck_audio_state)
+    _update_duck_audio_state()
+
+    # ════════════════════════════════════════════════════════════════════════
+    # LLM tab
+    # ════════════════════════════════════════════════════════════════════════
+    LLM.columnconfigure(1, weight=1)
+
+    tk.Label(
+        LLM,
+        text="Configure optional OpenAI post-editing for classic-mode transcriptions. "
+            "The API key is read from the OPENAI_API_KEY environment variable, not from config.json. "
+             "The OpenAI transcription backend can also use its own cleanup-oriented prompt file. "
+             "Use {transcript} in the user prompt template for the current transcript. "
+             "The post-edit toggle key cycles per-session profiles: off, dev, pro, personal, then off again. "
+             "Each profile uses its own markdown prompt file named <profile>_post_edit_prompt.md. "
+             "Keep project-specific vocabulary in local prompt or context files.",
+        fg="grey",
+        justify="left",
+        wraplength=520,
+    ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+
+    tk.Label(LLM, text="API key env:").grid(row=1, column=0, sticky="e", **pad)
+    api_key_status = "set" if _openai_api_key() else "not set"
+    tk.Label(LLM, text=f"OPENAI_API_KEY ({api_key_status})", anchor="w").grid(row=1, column=1, sticky="w", **pad)
+
+    def _make_scrolled_text(parent, row: int, height: int):
+        frame = tk.Frame(parent)
+        frame.grid(row=row, column=1, sticky="nsew", **pad)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(0, weight=1)
+        text_widget = tk.Text(frame, width=62, height=height, wrap="word")
+        yscroll = tk.Scrollbar(frame, orient="vertical", command=text_widget.yview)
+        text_widget.configure(yscrollcommand=yscroll.set)
+        text_widget.grid(row=0, column=0, sticky="nsew")
+        yscroll.grid(row=0, column=1, sticky="ns")
+        return text_widget
+
+    tk.Label(LLM, text="Model:").grid(row=2, column=0, sticky="e", **pad)
+    openai_model_var = tk.StringVar(master=win, value=config.get("openai_model", DEFAULT_CONFIG["openai_model"]))
+    tk.Entry(LLM, textvariable=openai_model_var, width=28).grid(row=2, column=1, sticky="w", **pad)
+
+    tk.Label(LLM, text="Reasoning effort:").grid(row=3, column=0, sticky="e", **pad)
+    reasoning_var = tk.StringVar(master=win, value=config.get("openai_reasoning_effort", DEFAULT_CONFIG["openai_reasoning_effort"]))
+    ttk.Combobox(
+        LLM,
+        textvariable=reasoning_var,
+        values=("minimal", "low", "medium", "high"),
+        width=12,
+        state="readonly",
+    ).grid(row=3, column=1, sticky="w", **pad)
+
+    tk.Label(LLM, text="Transcribe model:").grid(row=4, column=0, sticky="e", **pad)
+    openai_transcription_model_var = tk.StringVar(
+        master=win,
+        value=config.get("openai_transcription_model", DEFAULT_CONFIG["openai_transcription_model"]),
+    )
+    tk.Entry(LLM, textvariable=openai_transcription_model_var, width=28).grid(row=4, column=1, sticky="w", **pad)
+
+    tk.Label(LLM, text="Transcribe prompt:").grid(row=5, column=0, sticky="ne", **pad)
+    openai_transcription_prompt_text = _make_scrolled_text(LLM, row=5, height=4)
+    openai_transcription_prompt_text.insert(
+        "1.0",
+        config.get("openai_transcription_prompt", DEFAULT_CONFIG["openai_transcription_prompt"]),
+    )
+    tk.Label(LLM, text="Transcribe prompt file:").grid(row=6, column=0, sticky="ne", **pad)
+    tk.Label(
+        LLM,
+        text=str(_transcription_prompt_markdown_path(config)),
+        anchor="w",
+        justify="left",
+        wraplength=520,
+        fg="grey",
+    ).grid(row=6, column=1, sticky="w", **pad)
+
+    tk.Label(LLM, text="Notes base secs:").grid(row=7, column=0, sticky="e", **pad)
+    editor_notes_overlay_var = tk.StringVar(
+        master=win,
+        value=str(config.get("editor_notes_overlay_seconds", DEFAULT_CONFIG["editor_notes_overlay_seconds"])),
+    )
+    tk.Entry(LLM, textvariable=editor_notes_overlay_var, width=8).grid(row=7, column=1, sticky="w", **pad)
+
+    tk.Label(LLM, text="Chars / extra sec:").grid(row=8, column=0, sticky="e", **pad)
+    editor_notes_scale_var = tk.StringVar(
+        master=win,
+        value=str(config.get("editor_notes_chars_per_extra_second", DEFAULT_CONFIG["editor_notes_chars_per_extra_second"])),
+    )
+    tk.Entry(LLM, textvariable=editor_notes_scale_var, width=8).grid(row=8, column=1, sticky="w", **pad)
+
+    tk.Label(LLM, text="Toggle key:").grid(row=9, column=0, sticky="e", **pad)
+    post_edit_toggle_key_var = tk.StringVar(
+        master=win,
+        value=config.get("post_edit_toggle_key", DEFAULT_CONFIG["post_edit_toggle_key"]),
+    )
+    tk.Entry(LLM, textvariable=post_edit_toggle_key_var, width=8).grid(row=9, column=1, sticky="w", **pad)
+
+    tk.Label(LLM, text="Profile prompts:").grid(row=10, column=0, sticky="ne", **pad)
+    tk.Label(
+        LLM,
+        text="\n".join(str(_prompt_markdown_path(config, p)) for p in POST_EDIT_PROFILES),
+        anchor="w",
+        justify="left",
+        wraplength=520,
+        fg="grey",
+    ).grid(row=10, column=1, sticky="w", **pad)
+
+    tk.Label(LLM, text="System prompt:").grid(row=12, column=0, sticky="ne", **pad)
+    system_prompt_text = _make_scrolled_text(LLM, row=12, height=4)
+    system_prompt_text.insert("1.0", config.get("openai_system_prompt", DEFAULT_CONFIG["openai_system_prompt"]))
+
+    tk.Label(LLM, text="Developer prompt:").grid(row=13, column=0, sticky="ne", **pad)
+    developer_prompt_text = _make_scrolled_text(LLM, row=13, height=6)
+    developer_prompt_text.insert("1.0", config.get("openai_developer_prompt", DEFAULT_CONFIG["openai_developer_prompt"]))
+
+    tk.Label(LLM, text="User prompt template:").grid(row=14, column=0, sticky="ne", **pad)
+    user_prompt_text = _make_scrolled_text(LLM, row=14, height=8)
+    user_prompt_text.insert("1.0", config.get("openai_user_prompt_template", DEFAULT_CONFIG["openai_user_prompt_template"]))
 
     # ════════════════════════════════════════════════════════════════════════
     # Microphone Test tab
@@ -2293,6 +4350,8 @@ def open_settings(config: dict, on_save_callback):
             row_f.columnconfigure(0, weight=1)
 
             ts_str = entry.get("time", "")
+            text_value = (entry.get("text") or "").strip()
+            error_value = (entry.get("error") or "").strip()
 
             if entry.get("wav"):
                 # ── Failed entry ───────────────────────────────────────────
@@ -2327,10 +4386,9 @@ def open_settings(config: dict, on_save_callback):
 
                 retry_btn.config(command=_make_retry(entry, retry_btn))
 
-            else:
+            elif text_value:
                 # ── Success entry ──────────────────────────────────────────
-                text    = entry.get("text", "")
-                display = text if len(text) <= 72 else text[:69] + "..."
+                display = text_value if len(text_value) <= 72 else text_value[:69] + "..."
                 tk.Label(row_f, text=display, anchor="w", justify="left",
                          font=("Segoe UI", 9), wraplength=400).grid(row=0, column=0, sticky="ew")
 
@@ -2340,8 +4398,13 @@ def open_settings(config: dict, on_save_callback):
                         win.clipboard_append(t)
                     return _copy
 
-                tk.Button(row_f, text="Copy", command=_make_copy(text),
+                tk.Button(row_f, text="Copy", command=_make_copy(text_value),
                           width=6).grid(row=0, column=1, padx=(6, 0))
+                tk.Label(row_f, text=ts_str, fg="grey",
+                         font=("Segoe UI", 8)).grid(row=1, column=0, sticky="w", padx=2)
+            else:
+                tk.Label(row_f, text=error_value or "(empty history entry)", anchor="w", justify="left",
+                         fg="#6b7280", font=("Segoe UI", 9), wraplength=400).grid(row=0, column=0, sticky="ew")
                 tk.Label(row_f, text=ts_str, fg="grey",
                          font=("Segoe UI", 8)).grid(row=1, column=0, sticky="w", padx=2)
 
@@ -2355,13 +4418,14 @@ def open_settings(config: dict, on_save_callback):
         _add_class()
         _mon_active[0] = False
         new_cfg = dict(config)
+        new_cfg["transcription_backend"] = transcription_backend_var.get().strip() or DEFAULT_CONFIG["transcription_backend"]
         new_cfg["server_url"] = url_var.get().strip()
         new_cfg["language"]   = lang_var.get().strip() or None
         sel = mic_var.get()
         new_cfg["microphone_index"] = (
             None if sel == "(system default)" else int(sel.split(":")[0])
         )
-        if not new_cfg["server_url"]:
+        if new_cfg["transcription_backend"] == "http" and not new_cfg["server_url"]:
             messagebox.showerror("Error", "Server URL cannot be empty.")
             return
         hotkey = hotkey_var.get().strip()
@@ -2402,12 +4466,52 @@ def open_settings(config: dict, on_save_callback):
         new_cfg["right_click_paste_input_classes"] = list(right_click_lb.get(0, "end"))
         new_cfg["simple_mode_input_classes"] = list(simple_mode_lb.get(0, "end"))
         new_cfg["live_mode_input_classes"] = list(live_mode_lb.get(0, "end"))
-        new_cfg["main_live_mode"] = bool(main_live_var.get())
+        new_cfg["main_mode"] = main_mode_var.get().strip().lower() or DEFAULT_CONFIG["main_mode"]
+        new_cfg["main_live_mode"] = new_cfg["main_mode"] == "live"
         new_cfg["main_simple_mode"] = bool(main_simple_var.get())
-        new_cfg["fast_live_mode"] = bool(fast_live_var.get())
+        new_cfg["main_post_edit_mode"] = False
+        new_cfg["fast_mode"] = fast_mode_var.get().strip().lower() or DEFAULT_CONFIG["fast_mode"]
+        new_cfg["fast_live_mode"] = new_cfg["fast_mode"] == "live"
         new_cfg["fast_simple_mode"] = bool(fast_simple_var.get())
+        new_cfg["fast_post_edit_mode"] = False
+        new_cfg["main_review_non_post_edit_sessions"] = bool(main_review_non_post_edit_var.get())
+        new_cfg["fast_review_non_post_edit_sessions"] = bool(fast_review_non_post_edit_var.get())
+        try:
+            new_cfg["preview_max_width"] = max(500, int(preview_max_width_var.get().strip() or DEFAULT_CONFIG["preview_max_width"]))
+        except Exception:
+            new_cfg["preview_max_width"] = DEFAULT_CONFIG["preview_max_width"]
+        try:
+            new_cfg["preview_max_height"] = max(220, int(preview_max_height_var.get().strip() or DEFAULT_CONFIG["preview_max_height"]))
+        except Exception:
+            new_cfg["preview_max_height"] = DEFAULT_CONFIG["preview_max_height"]
+        new_cfg["duck_audio_during_dictation"] = bool(duck_audio_var.get())
+        try:
+            new_cfg["duck_audio_level_percent"] = max(0, min(100, int(duck_audio_level_var.get().strip() or DEFAULT_CONFIG["duck_audio_level_percent"])))
+        except Exception:
+            new_cfg["duck_audio_level_percent"] = DEFAULT_CONFIG["duck_audio_level_percent"]
+        new_cfg["openai_model"] = openai_model_var.get().strip() or DEFAULT_CONFIG["openai_model"]
+        new_cfg["openai_transcription_model"] = (
+            openai_transcription_model_var.get().strip() or DEFAULT_CONFIG["openai_transcription_model"]
+        )
+        new_cfg["openai_transcription_prompt"] = (
+            openai_transcription_prompt_text.get("1.0", "end").strip() or DEFAULT_CONFIG["openai_transcription_prompt"]
+        )
+        new_cfg["openai_reasoning_effort"] = reasoning_var.get().strip() or DEFAULT_CONFIG["openai_reasoning_effort"]
+        try:
+            new_cfg["editor_notes_overlay_seconds"] = max(0.5, float(editor_notes_overlay_var.get().strip() or DEFAULT_CONFIG["editor_notes_overlay_seconds"]))
+        except Exception:
+            new_cfg["editor_notes_overlay_seconds"] = DEFAULT_CONFIG["editor_notes_overlay_seconds"]
+        try:
+            new_cfg["editor_notes_chars_per_extra_second"] = max(1.0, float(editor_notes_scale_var.get().strip() or DEFAULT_CONFIG["editor_notes_chars_per_extra_second"]))
+        except Exception:
+            new_cfg["editor_notes_chars_per_extra_second"] = DEFAULT_CONFIG["editor_notes_chars_per_extra_second"]
+        new_cfg["post_edit_toggle_key"] = post_edit_toggle_key_var.get().strip().lower() or DEFAULT_CONFIG["post_edit_toggle_key"]
+        new_cfg["openai_system_prompt"] = system_prompt_text.get("1.0", "end").strip() or DEFAULT_CONFIG["openai_system_prompt"]
+        new_cfg["openai_developer_prompt"] = developer_prompt_text.get("1.0", "end").strip() or DEFAULT_CONFIG["openai_developer_prompt"]
+        new_cfg["openai_user_prompt_template"] = user_prompt_text.get("1.0", "end").strip() or DEFAULT_CONFIG["openai_user_prompt_template"]
         new_cfg["live_mode"]   = new_cfg["main_live_mode"]
         new_cfg["simple_mode"] = new_cfg["main_simple_mode"]
+        _current_config[0] = new_cfg
         sync_input_classes(new_cfg)
         save_config(new_cfg)
         on_save_callback(new_cfg)
@@ -2427,11 +4531,27 @@ def open_settings(config: dict, on_save_callback):
 
 # ── Tray icon ─────────────────────────────────────────────────────────────────
 
-def _make_icon(color: tuple[int, int, int] = (34, 197, 94)):
-    from PIL import Image, ImageDraw
+def _make_icon(color: tuple[int, int, int] = (34, 197, 94), badge_text: str | None = None):
+    from PIL import Image, ImageDraw, ImageFont
     img  = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
     draw.ellipse([4, 4, 60, 60], fill=(*color, 255))
+    if badge_text:
+        try:
+            font = ImageFont.truetype("arial.ttf", 34)
+        except Exception:
+            font = ImageFont.load_default()
+        bbox = draw.textbbox((0, 0), badge_text, font=font)
+        text_w = bbox[2] - bbox[0]
+        text_h = bbox[3] - bbox[1]
+        draw.text(
+            ((64 - text_w) / 2, (64 - text_h) / 2 - 2),
+            badge_text,
+            fill=(255, 255, 255, 255),
+            font=font,
+            stroke_width=2,
+            stroke_fill=(0, 0, 0, 160),
+        )
     return img
 
 
@@ -2464,17 +4584,20 @@ def run_tray(config_holder: list[dict]):
 
     def on_settings(icon, item):
         def _open():
-            def on_saved(new_cfg):
-                old_cfg = config_holder[0]
-                config_holder[0] = new_cfg
-                hotkey_keys = {
-                    "hotkey", "fast_hotkey", "undo_hotkey",
-                    "main_live_mode", "main_simple_mode",
-                    "fast_live_mode", "fast_simple_mode",
-                }
-                if any(old_cfg.get(k) != new_cfg.get(k) for k in hotkey_keys):
-                    _bind_hotkeys()
-            open_settings(get_cfg(), on_saved)
+            try:
+                def on_saved(new_cfg):
+                    old_cfg = config_holder[0]
+                    config_holder[0] = new_cfg
+                    hotkey_keys = {
+                        "hotkey", "fast_hotkey", "undo_hotkey",
+                        "main_live_mode", "main_simple_mode",
+                        "fast_live_mode", "fast_simple_mode",
+                    }
+                    if any(old_cfg.get(k) != new_cfg.get(k) for k in hotkey_keys):
+                        _bind_hotkeys()
+                open_settings(get_cfg(), on_saved)
+            except Exception as exc:
+                print(f"[TRAY] Failed to open settings: {_safe_console_text(exc)}", flush=True)
         threading.Thread(target=_open, daemon=True).start()
 
     devices = list_input_devices()
@@ -2500,10 +4623,7 @@ def run_tray(config_holder: list[dict]):
         return _checked
 
     def on_copy_last(icon, item):
-        text = next(
-            (e["text"] for e in reversed(list(_history)) if e.get("text")),
-            None,
-        )
+        text = _last_result_text[0] or _latest_history_text() or None
         if not text:
             return
         import tkinter as tk
@@ -2516,7 +4636,7 @@ def run_tray(config_holder: list[dict]):
         root.mainloop()
 
     def _has_last(item) -> bool:
-        return any(e.get("text") for e in _history)
+        return bool(_last_result_text[0] or _latest_history_text())
 
     def on_quit(icon, item):
         global _native_hotkeys
@@ -2567,18 +4687,80 @@ def run_tray(config_holder: list[dict]):
     # Never touch pystray icon handles here — Win32 DestroyIcon crashes across threads.
     # Icon updates happen inside _session (a plain daemon thread) instead.
     def _on_hotkey(hotkey_name: str, insert_mode: str, profile: str):
+        pending_draft = _peek_pending_draft()
+        if pending_draft:
+            tap_deadline = time.time() + _DRAFT_TAP_RELEASE_MAX
+            while time.time() < tap_deadline and _hotkey_is_down_now(hotkey_name, get_cfg()):
+                time.sleep(0.01)
+            if _hotkey_is_down_now(hotkey_name, get_cfg()):
+                print("[DRAFT] Starting a fresh session and clearing the pending preview.", flush=True)
+                _clear_pending_draft()
+            else:
+                if pending_draft.get("review_open"):
+                    print("[DRAFT] Review window is open. Copy from there if you want a manual paste.", flush=True)
+                    return
+                action = _register_pending_draft_tap(get_cfg)
+                if action == "insert_notes":
+                    latest_draft = _peek_pending_draft()
+                    if latest_draft and not latest_draft.get("post_edit"):
+                        print("[DRAFT] Quick modifier gesture requested an edit pass.", flush=True)
+                        _start_pending_draft_post_edit(get_cfg)
+                    else:
+                        print("[DRAFT] Quick insert with editor notes requested.", flush=True)
+                        _insert_pending_draft(get_cfg(), include_notes=True)
+                elif action == "double":
+                    print("[DRAFT] Opening review window for the pending preview.", flush=True)
+                    _set_pending_draft_review(True)
+                else:
+                    print("[DRAFT] Pending preview tap registered.", flush=True)
+                return
+
+        pending_notes = _peek_pending_editor_notes()
+        if pending_notes:
+            tap_deadline = time.time() + 0.28
+            while time.time() < tap_deadline and _hotkey_is_down_now(hotkey_name, get_cfg()):
+                time.sleep(0.01)
+            if not _hotkey_is_down_now(hotkey_name, get_cfg()):
+                if not is_text_input_focused():
+                    print("[POST] Editor notes available, but focused control is not a text input.", flush=True)
+                    return
+                notes_to_insert = _consume_pending_editor_notes()
+                if notes_to_insert:
+                    note_block = _format_editor_notes_for_insert(notes_to_insert)
+                    note_insert_mode = choose_insert_mode()
+                    print(f"[POST] Appending editor notes via {note_insert_mode}.", flush=True)
+                    _release_possible_modifiers()
+                    if note_insert_mode == "type":
+                        type_text(note_block, char_delay=get_cfg().get("char_delay", 0.0))
+                    else:
+                        paste_text(note_block, method=note_insert_mode, source="editor_notes_append")
+                    _last_typed[0] = (_last_typed[0] or "") + note_block
+                return
         if _session_lock.locked():
             return  # Already recording — silently drop the repeat trigger
         print(f"[HOTKEY] Triggered ({profile}/{insert_mode}) — starting session.", flush=True)
         threading.Thread(target=_session, args=(hotkey_name, insert_mode, profile), daemon=True).start()
 
     def _session(hotkey_name: str, insert_mode: str, profile: str):
+        active_icon = _ICON_FAST if profile == "fast" else _ICON_RECORDING
+        active_label = "fast mode" if profile == "fast" else "recording"
+
+        def _update_active_icon(post_edit_enabled):
+            edit_profile = _post_edit_profile_name(post_edit_enabled)
+            label = f"{active_label} + {edit_profile}" if edit_profile else active_label
+            tray_icon.icon = _make_icon(active_icon, badge_text=(edit_profile[:1].upper() if edit_profile else None))
+            tray_icon.title = f"OverMultiASRSuite ({label}...)"
+
         try:
-            active_icon = _ICON_FAST if profile == "fast" else _ICON_RECORDING
-            active_label = "fast mode" if profile == "fast" else "recording"
-            tray_icon.icon  = _make_icon(active_icon)
+            _update_active_icon(False)
             tray_icon.title = f"OverMultiASRSuite ({active_label}…)"
-            run_session(get_cfg(), insert_mode=insert_mode, profile=profile, hotkey_name=hotkey_name)
+            run_session(
+                get_cfg(),
+                insert_mode=insert_mode,
+                profile=profile,
+                hotkey_name=hotkey_name,
+                on_post_edit_change=_update_active_icon,
+            )
         finally:
             _release_possible_modifiers()
             tray_icon.icon  = _make_icon(_ICON_IDLE)
@@ -2664,9 +4846,14 @@ def main():
     save_config(cfg)   # persist defaults on first run
     _load_history()
     sync_input_classes(cfg)
+    _current_config[0] = cfg
 
     print("OverMultiASRSuite", flush=True)
-    print(f"  Server : {cfg['server_url']}", flush=True)
+    print(f"  Backend: {cfg.get('transcription_backend', DEFAULT_CONFIG['transcription_backend'])}", flush=True)
+    if (cfg.get("transcription_backend") or DEFAULT_CONFIG["transcription_backend"]) == "openai":
+        print(f"  Model  : {cfg.get('openai_transcription_model', DEFAULT_CONFIG['openai_transcription_model'])}", flush=True)
+    else:
+        print(f"  Server : {cfg['server_url']}", flush=True)
     print(f"  Hotkey : {cfg['hotkey']}", flush=True)
     if cfg.get("fast_hotkey"):
         print(f"  Fast   : {cfg['fast_hotkey']}", flush=True)

@@ -1,0 +1,19 @@
+Transcribe the spoken audio into clean text.
+
+This is a transcription task, not a rewriting task.
+
+Requirements:
+- Return only the transcript text.
+- Do not return prompt text, instructions, headings, bullet lists, or explanations.
+- Do not echo this prompt.
+- Do not add surrounding quotes.
+- Do not use ellipses as continuation markers.
+- Do not add an ellipsis at the end of the transcription.
+- Prefer clean sentence punctuation when the wording is clear.
+- Remove obvious filler words such as "um", "uh", "you know", "like", and "I mean" when doing so does not change meaning.
+- Preserve technical vocabulary, product names, file names, identifiers, and code-like terms exactly when possible.
+
+Optional local customization:
+- Add product names or homophone corrections here in your local `transcription_prompt.md`.
+
+If the audio is unclear, still return the best transcript text you can, but only transcript text.

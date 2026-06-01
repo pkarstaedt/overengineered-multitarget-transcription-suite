@@ -15,6 +15,7 @@ import argparse
 import io
 import tempfile
 import time
+import unicodedata
 from pathlib import Path
 
 import numpy as np
@@ -88,6 +89,18 @@ def _load_audio_16k_mono(data: bytes) -> tuple[np.ndarray, float]:
     return audio, duration
 
 
+def _contains_non_latin_letters(text: str) -> bool:
+    for ch in text:
+        if not ch.isalpha():
+            continue
+        try:
+            if "LATIN" not in unicodedata.name(ch):
+                return True
+        except ValueError:
+            return True
+    return False
+
+
 # ── Endpoint ──────────────────────────────────────────────────────────────────
 
 @app.post("/transcribe")
@@ -124,6 +137,9 @@ async def transcribe(
 
     elapsed = time.time() - t0
     text = text.strip()
+    if _contains_non_latin_letters(text):
+        print(f"[REQ] Non-Latin transcript suppressed: {text!r}", flush=True)
+        text = ""
     print(f"[REQ] Transcribed in {elapsed:.2f}s: {text!r}", flush=True)
 
     return JSONResponse({
