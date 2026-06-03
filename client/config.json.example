@@ -24,7 +24,6 @@
   "fast_post_edit_mode": false,
   "openai_model": "gpt-5-mini",
   "openai_reasoning_effort": "low",
-  "openai_context_markdown_file": "post_edit_context.md",
   "openai_dev_prompt_markdown_file": "dev_post_edit_prompt.md",
   "openai_pro_prompt_markdown_file": "pro_post_edit_prompt.md",
   "openai_personal_prompt_markdown_file": "personal_post_edit_prompt.md",

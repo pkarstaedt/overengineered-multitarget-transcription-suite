@@ -136,17 +136,36 @@ The client is tested against [faster-whisper-server](https://github.com/fedirz/f
 
 ## Installation
 
+### Prerequisites
+
+The client setup and build scripts require:
+
+- Python 3.11+
+- [uv](https://github.com/astral-sh/uv)
+- Administrator privileges when running the client, because global hotkey interception requires elevation
+
+`client/install.bat` and `client/build.bat` both fail early with a clear error if `uv` is not available on `PATH`.
+
+Building the standalone executable also requires the [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0) so the native hotkey helper can be rebuilt.
+
 ### Run from source
 
-Requires Python 3.11+ and [uv](https://github.com/astral-sh/uv).
+Create the shared client virtual environment:
 
 ```bat
 cd client
-uv venv
-uv pip install -r requirements.txt
+install.bat
 ```
 
-Run (must be Administrator):
+This creates or reuses `client/.venv` and installs both runtime dependencies and build tooling into that same environment.
+
+Run:
+
+```bat
+run.bat
+```
+
+For console/debug runs:
 
 ```bat
 .venv\Scripts\python overmultiasrsuite.py
@@ -161,17 +180,23 @@ $env:OPENAI_API_KEY = "<your-openai-api-key>"
 
 ### Distribute as a standalone exe
 
+`build.bat` uses the same `client/.venv` created by `install.bat`. If `.venv` does not exist yet, it creates it and installs the same runtime/build dependencies before packaging.
+
 ```bat
 cd client
 build.bat
 ```
 
-Produces `client/dist/OverMultiASRSuite.exe` plus a native hotkey sidecar. Distribute alongside your local `config.json` if you want to preserve settings between machines:
+Produces `client/OverMultiASRSuite.exe` plus a native hotkey sidecar in the client directory, so the exe uses the same `config.json`, prompt Markdown files, history, and log location as source runs. `client/dist/` is disposable staging output from PyInstaller.
+
+Distribute alongside your local `config.json` and prompt Markdown files if you want to preserve settings between machines:
 
 ```
 OverMultiASRSuite.exe
 HotkeyHelper.exe
 config.json
+*_post_edit_prompt.md
+transcription_prompt.md
 ```
 
 `history.json` and `overmultiasrsuite.log` are created automatically next to the exe on first run.
@@ -241,23 +266,14 @@ Each file contains three editable sections:
 
 The Settings dialog still lets you edit these fields, but saving writes them back to Markdown files instead of storing large escaped multiline strings in `config.json`. The repository keeps `.example` versions only; your real profile prompts are ignored by git.
 
-You can also provide durable product / repo / coding-agent context through a second Markdown file:
+There are four prompt Markdown files in normal use:
 
-```text
-client/post_edit_context.md
-```
+- `client/transcription_prompt.md`
+- `client/dev_post_edit_prompt.md`
+- `client/pro_post_edit_prompt.md`
+- `client/personal_post_edit_prompt.md`
 
-Its contents are available to the user prompt through:
-
-- `{project_context}`
-- `{agent_guidance}`
-
-This is the best place to put:
-
-- what you are building
-- repo-level guardrails
-- terminology corrections
-- coding-agent prompting preferences
+Put any project vocabulary, repo guardrails, terminology corrections, or prompting preferences directly into the relevant post-edit profile prompt.
 
 The optional OpenAI transcription backend has its own separate Markdown prompt file:
 
@@ -610,8 +626,6 @@ client/
   *_post_edit_prompt.md Local profile prompts (auto-created/local-only)
   transcription_prompt.md.example Public transcription prompt template
   transcription_prompt.md Local transcription prompt (auto-created/local-only)
-  post_edit_context.md.example Public context template
-  post_edit_context.md  Local project context (auto-created/local-only)
   history.json          Transcription history (auto-created)
   overmultiasrsuite.log    Log file when running as exe (auto-created)
   failed_audio/         WAV recordings of failed transcriptions, for retry (auto-created)

@@ -21,12 +21,9 @@ When useful, make implicit structure explicit: affected area, expected behavior,
 
 Use `editor_notes` only for extra terminology, missing constraints, or prompt-improving additions that would genuinely help the downstream agent. Leave it empty if the edited text stands on its own.
 
-Project-specific vocabulary can be added in your local prompt file or `post_edit_context.md`.
+Project-specific vocabulary can be added directly in this local profile prompt file.
 
 ## User
-
-Context:
-{project_context}
 
 Recent transcripts:
 {recent_transcripts}

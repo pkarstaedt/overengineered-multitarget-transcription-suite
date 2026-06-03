@@ -18,12 +18,6 @@ import threading
 import time
 from pathlib import Path
 
-import keyboard
-import numpy as np
-import requests
-import sounddevice as sd
-import soundfile as sf
-
 # ── Paths (frozen-exe aware) ──────────────────────────────────────────────────
 
 def _app_dir() -> Path:
@@ -42,9 +36,20 @@ class _RECT(ctypes.Structure):
     ]
 
 
-# When running as a frozen exe there is no console, so redirect prints to a
-# rolling log file next to the exe instead.
-if getattr(sys, "frozen", False):
+def _stdio_is_usable(stream) -> bool:
+    if stream is None:
+        return False
+    try:
+        stream.write("")
+        stream.flush()
+        return True
+    except Exception:
+        return False
+
+
+# When running as a frozen exe or via pythonw there is no usable console, so
+# redirect prints to a rolling log file next to the app instead.
+if getattr(sys, "frozen", False) or not (_stdio_is_usable(sys.stdout) and _stdio_is_usable(sys.stderr)):
     _log = open(_app_dir() / "overmultiasrsuite.log", "a", encoding="utf-8", buffering=1)
     sys.stdout = _log
     sys.stderr = _log
@@ -70,9 +75,14 @@ def _safe_console_text(value) -> str:
 
 # ── Config ───────────────────────────────────────────────────────────────────
 
+import keyboard
+import numpy as np
+import requests
+import sounddevice as sd
+import soundfile as sf
+
 CONFIG_FILE = _app_dir() / "config.json"
 DEFAULT_PROMPT_FILE = "post_edit_prompt.md"
-DEFAULT_CONTEXT_FILE = "post_edit_context.md"
 DEFAULT_TRANSCRIPTION_PROMPT_FILE = "transcription_prompt.md"
 POST_EDIT_PROFILES = ("dev", "pro", "personal")
 
@@ -109,7 +119,6 @@ DEFAULT_CONFIG = {
     "openai_model": "gpt-5-mini",
     "openai_reasoning_effort": "low",
     "openai_prompt_markdown_file": DEFAULT_PROMPT_FILE,
-    "openai_context_markdown_file": DEFAULT_CONTEXT_FILE,
     "editor_notes_overlay_seconds": 4.0,
     "editor_notes_chars_per_extra_second": 45.0,
     "post_edit_toggle_key": "y",
@@ -164,6 +173,7 @@ def load_config() -> dict:
         if legacy_prompt:
             cfg.setdefault("openai_user_prompt_template", legacy_prompt)
         cfg.pop("openai_api_key", None)
+        cfg.pop("openai_context_markdown_file", None)
         cfg.setdefault("main_live_mode", cfg.get("live_mode", DEFAULT_CONFIG["main_live_mode"]))
         cfg.setdefault("main_simple_mode", cfg.get("simple_mode", DEFAULT_CONFIG["main_simple_mode"]))
         cfg.setdefault("fast_live_mode", cfg.get("live_mode", DEFAULT_CONFIG["fast_live_mode"]))
@@ -196,6 +206,7 @@ def save_config(cfg: dict):
     _save_prompt_markdown(cfg)
     _save_transcription_prompt_markdown(cfg)
     cfg.pop("openai_api_key", None)
+    cfg.pop("openai_context_markdown_file", None)
     cfg.pop("review_non_post_edit_sessions", None)
     cfg.pop("openai_transcription_prompt", None)
     cfg.pop("openai_system_prompt", None)
@@ -290,14 +301,6 @@ def _prompt_markdown_path(cfg: dict | None = None, profile: str = "dev") -> Path
     return path
 
 
-def _context_markdown_path(cfg: dict | None = None) -> Path:
-    name = (cfg or {}).get("openai_context_markdown_file", DEFAULT_CONTEXT_FILE)
-    path = Path(name)
-    if not path.is_absolute():
-        path = _app_dir() / path
-    return path
-
-
 def _transcription_prompt_markdown_path(cfg: dict | None = None) -> Path:
     name = (cfg or {}).get("openai_transcription_prompt_markdown_file", DEFAULT_TRANSCRIPTION_PROMPT_FILE)
     path = Path(name)
@@ -377,23 +380,9 @@ def _load_prompt_markdown(cfg: dict, profile: str = "dev") -> dict[str, str]:
     return sections
 
 
-def _save_prompt_markdown(cfg: dict, profile: str = "dev"):
+def _save_prompt_markdown(cfg: dict, profile: str = "dev", sections: dict[str, str] | None = None):
     path = _prompt_markdown_path(cfg, profile)
-    path.write_text(_render_prompt_markdown(_prompt_sections_from_config(cfg)), encoding="utf-8")
-
-
-def _load_context_markdown(cfg: dict) -> str:
-    path = _context_markdown_path(cfg)
-    if path.exists():
-        try:
-            return path.read_text(encoding="utf-8").strip()
-        except Exception:
-            return ""
-    try:
-        path.write_text("", encoding="utf-8")
-    except Exception:
-        pass
-    return ""
+    path.write_text(_render_prompt_markdown(sections or _prompt_sections_from_config(cfg)), encoding="utf-8")
 
 
 def _load_transcription_prompt_markdown(cfg: dict) -> str:
@@ -427,6 +416,7 @@ def _helper_project_dir() -> Path:
 def _helper_exe_path() -> Path | None:
     candidates = [
         _app_dir() / "HotkeyHelper.exe",
+        _helper_project_dir() / "publish" / "HotkeyHelper.exe",
         _helper_project_dir() / "bin" / "Release" / "net8.0-windows" / "win-x64" / "publish" / "HotkeyHelper.exe",
         _helper_project_dir() / "bin" / "Release" / "net8.0-windows" / "HotkeyHelper.exe",
     ]
@@ -446,6 +436,21 @@ def _helper_dll_path() -> Path | None:
     return None
 
 
+def _dotnet_sdk_available() -> bool:
+    try:
+        result = subprocess.run(
+            ["dotnet", "--list-sdks"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=3,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0,
+        )
+    except Exception:
+        return False
+    return result.returncode == 0 and bool(result.stdout.strip())
+
+
 def _helper_command(*args: str) -> list[str]:
     if not getattr(sys, "frozen", False):
         helper_dll = _helper_dll_path()
@@ -453,7 +458,7 @@ def _helper_command(*args: str) -> list[str]:
             return ["dotnet", str(helper_dll), *args]
 
         project = _helper_project_dir() / "HotkeyHelper.csproj"
-        if project.exists():
+        if project.exists() and _dotnet_sdk_available():
             return ["dotnet", "run", "--project", str(project), "--configuration", "Release", "--", *args]
 
     helper_exe = _helper_exe_path()
@@ -1532,7 +1537,7 @@ def _normalize_promptish_text(value: str) -> str:
     return re.sub(r"\s+", " ", (value or "").strip()).lower()
 
 
-def _looks_like_prompt_echo(edited_text: str, *, transcript: str, system_prompt: str, developer_prompt: str, rendered_user_prompt: str, project_context: str) -> bool:
+def _looks_like_prompt_echo(edited_text: str, *, transcript: str, system_prompt: str, developer_prompt: str, rendered_user_prompt: str) -> bool:
     edited_norm = _normalize_promptish_text(edited_text)
     transcript_norm = _normalize_promptish_text(transcript)
     if not edited_norm or len(edited_norm) < 80:
@@ -1544,7 +1549,6 @@ def _looks_like_prompt_echo(edited_text: str, *, transcript: str, system_prompt:
         system_prompt,
         developer_prompt,
         rendered_user_prompt,
-        project_context,
     ]
     for source in prompt_sources:
         source_norm = _normalize_promptish_text(source)
@@ -1575,7 +1579,6 @@ def _post_edit_text(text: str, config: dict, profile: str, edit_profile: str = "
     system_prompt = prompt_sections.get("system") or ""
     developer_prompt = prompt_sections.get("developer") or ""
     user_prompt_template = prompt_sections.get("user") or ""
-    project_context = ""
     reasoning_effort = (config.get("openai_reasoning_effort") or "low").strip().lower()
 
     if not api_key or not model or not user_prompt_template.strip():
@@ -1584,8 +1587,6 @@ def _post_edit_text(text: str, config: dict, profile: str, edit_profile: str = "
 
     prompt_values = {
         "transcript": text,
-        "project_context": project_context,
-        "agent_guidance": project_context,
         **_recent_transcript_placeholders(),
     }
     rendered_developer_prompt = developer_prompt
@@ -1682,9 +1683,8 @@ def _post_edit_text(text: str, config: dict, profile: str, edit_profile: str = "
             system_prompt=system_prompt,
             developer_prompt=rendered_developer_prompt,
             rendered_user_prompt=rendered_user_prompt,
-            project_context=project_context,
         ):
-            print("[POST] Edited text looks like prompt/context echo - keeping original transcript.", flush=True)
+            print("[POST] Edited text looks like prompt echo - keeping original transcript.", flush=True)
             return text, editor_notes, False
 
         print(f"[POST] Edited text: {_safe_console_text(repr(edited))}", flush=True)
@@ -1715,6 +1715,10 @@ def _post_wav_bytes(wav_bytes: bytes, config: dict) -> tuple[str | None, str | N
         body = resp.json()
         text = body.get("text", "").strip()
         print(f"[API] Got: {_safe_console_text(repr(text))}", flush=True)
+        if not text:
+            msg = "Empty transcription (server returned no text)"
+            print(f"[API] Error: {msg}", flush=True)
+            return None, msg
         return text or None, None
     except requests.exceptions.ConnectionError:
         msg = "Service unavailable"
@@ -1768,6 +1772,10 @@ def _post_wav_bytes_openai(wav_bytes: bytes, config: dict) -> tuple[str | None, 
         body = resp.json()
         text = (body.get("text") or "").strip()
         print(f"[API] Got: {_safe_console_text(repr(text))}", flush=True)
+        if not text:
+            msg = "Empty OpenAI transcription (server returned no text)"
+            print(f"[API] Error: {msg}", flush=True)
+            return None, msg
         return text or None, None
     except requests.exceptions.ConnectionError:
         msg = "OpenAI unavailable"
@@ -3968,15 +3976,27 @@ def open_settings(config: dict, on_save_callback):
     )
     tk.Entry(LLM, textvariable=post_edit_toggle_key_var, width=8).grid(row=9, column=1, sticky="w", **pad)
 
-    tk.Label(LLM, text="Profile prompts:").grid(row=10, column=0, sticky="ne", **pad)
+    tk.Label(LLM, text="Post-edit profile:").grid(row=10, column=0, sticky="e", **pad)
+    prompt_profile_var = tk.StringVar(master=win, value=POST_EDIT_PROFILES[0])
+    prompt_profile_combo = ttk.Combobox(
+        LLM,
+        textvariable=prompt_profile_var,
+        values=POST_EDIT_PROFILES,
+        width=12,
+        state="readonly",
+    )
+    prompt_profile_combo.grid(row=10, column=1, sticky="w", **pad)
+
+    tk.Label(LLM, text="Profile prompt file:").grid(row=11, column=0, sticky="ne", **pad)
+    prompt_profile_path_var = tk.StringVar(master=win, value=str(_prompt_markdown_path(config, POST_EDIT_PROFILES[0])))
     tk.Label(
         LLM,
-        text="\n".join(str(_prompt_markdown_path(config, p)) for p in POST_EDIT_PROFILES),
+        textvariable=prompt_profile_path_var,
         anchor="w",
         justify="left",
         wraplength=520,
         fg="grey",
-    ).grid(row=10, column=1, sticky="w", **pad)
+    ).grid(row=11, column=1, sticky="w", **pad)
 
     tk.Label(LLM, text="System prompt:").grid(row=12, column=0, sticky="ne", **pad)
     system_prompt_text = _make_scrolled_text(LLM, row=12, height=4)
@@ -3989,6 +4009,42 @@ def open_settings(config: dict, on_save_callback):
     tk.Label(LLM, text="User prompt template:").grid(row=14, column=0, sticky="ne", **pad)
     user_prompt_text = _make_scrolled_text(LLM, row=14, height=8)
     user_prompt_text.insert("1.0", config.get("openai_user_prompt_template", DEFAULT_CONFIG["openai_user_prompt_template"]))
+
+    prompt_sections_by_profile = {
+        profile: _load_prompt_markdown(config, profile)
+        for profile in POST_EDIT_PROFILES
+    }
+    active_prompt_profile = [POST_EDIT_PROFILES[0]]
+
+    def _prompt_fields_to_sections() -> dict[str, str]:
+        return {
+            "system": system_prompt_text.get("1.0", "end").strip(),
+            "developer": developer_prompt_text.get("1.0", "end").strip(),
+            "user": user_prompt_text.get("1.0", "end").strip(),
+        }
+
+    def _store_active_prompt_profile():
+        prompt_sections_by_profile[active_prompt_profile[0]] = _prompt_fields_to_sections()
+
+    def _load_prompt_profile(profile: str):
+        profile = _post_edit_profile_name(profile) or POST_EDIT_PROFILES[0]
+        sections = prompt_sections_by_profile.get(profile) or _load_prompt_markdown(config, profile)
+        for widget, key in (
+            (system_prompt_text, "system"),
+            (developer_prompt_text, "developer"),
+            (user_prompt_text, "user"),
+        ):
+            widget.delete("1.0", "end")
+            widget.insert("1.0", sections.get(key, ""))
+        prompt_profile_path_var.set(str(_prompt_markdown_path(config, profile)))
+        active_prompt_profile[0] = profile
+
+    def _on_prompt_profile_changed(_event=None):
+        _store_active_prompt_profile()
+        _load_prompt_profile(prompt_profile_var.get())
+
+    prompt_profile_combo.bind("<<ComboboxSelected>>", _on_prompt_profile_changed)
+    _load_prompt_profile(POST_EDIT_PROFILES[0])
 
     # ════════════════════════════════════════════════════════════════════════
     # Microphone Test tab
@@ -4026,10 +4082,14 @@ def open_settings(config: dict, on_save_callback):
 
     _mon_active = [False]
     _test_audio = [None]
+    _test_audio_sr = [16000]
 
     def _selected_device():
         sel = mic_var.get()
         return None if sel == "(system default)" else int(sel.split(":")[0])
+
+    def _selected_device_sample_rate() -> int:
+        return _device_sample_rate(_selected_device()) or int(config.get("sample_rate", 16000))
 
     def _update_meter(pct, db, rms):
         w     = meter.winfo_width() or 300
@@ -4046,7 +4106,9 @@ def open_settings(config: dict, on_save_callback):
 
     def _monitor_loop():
         try:
-            with sd.InputStream(device=_selected_device(), samplerate=16000,
+            native_sr = _selected_device_sample_rate()
+            print(f"[MIC TEST] Monitor using {native_sr} Hz.", flush=True)
+            with sd.InputStream(device=_selected_device(), samplerate=native_sr,
                                 channels=1, dtype="int16", blocksize=512) as stream:
                 while _mon_active[0]:
                     data, _ = stream.read(512)
@@ -4083,16 +4145,19 @@ def open_settings(config: dict, on_save_callback):
         def _do():
             _test_audio[0] = None
             try:
+                native_sr = _selected_device_sample_rate()
+                _test_audio_sr[0] = native_sr
+                print(f"[MIC TEST] Recording test using {native_sr} Hz.", flush=True)
                 for remaining in range(3, 0, -1):
                     win.after(0, lambda n=remaining: rec_btn.config(
                         text=f"Recording... {n}s", state="disabled"))
-                    chunk = sd.rec(16000, samplerate=16000, channels=1,
+                    chunk = sd.rec(native_sr, samplerate=native_sr, channels=1,
                                    dtype="int16", device=_selected_device())
                     sd.wait()
                     rms = float(np.sqrt(np.mean(chunk.astype(np.float64) ** 2)))
                     db  = 20 * np.log10(max(rms, 1.0) / 32768.0)
                     pct = max(0.0, min(100.0, (db + 60) / 60 * 100))
-                    win.after(0, lambda p=pct, d=db: _update_meter(p, d))
+                    win.after(0, lambda p=pct, d=db, r=rms: _update_meter(p, d, r))
                     _test_audio[0] = chunk if _test_audio[0] is None else np.concatenate([_test_audio[0], chunk])
             except Exception as exc:
                 hint = " (WDM-KS)" if "-9999" in str(exc) else ""
@@ -4105,7 +4170,7 @@ def open_settings(config: dict, on_save_callback):
 
     def _play_test():
         if _test_audio[0] is not None:
-            sd.play(_test_audio[0], samplerate=16000)
+            sd.play(_test_audio[0], samplerate=_test_audio_sr[0])
 
     mon_btn  = tk.Button(btn_row, text="Monitor",   command=_toggle_monitor, width=10)
     rec_btn  = tk.Button(btn_row, text="Record 3s", command=_record_test,    width=10)
@@ -4506,9 +4571,13 @@ def open_settings(config: dict, on_save_callback):
         except Exception:
             new_cfg["editor_notes_chars_per_extra_second"] = DEFAULT_CONFIG["editor_notes_chars_per_extra_second"]
         new_cfg["post_edit_toggle_key"] = post_edit_toggle_key_var.get().strip().lower() or DEFAULT_CONFIG["post_edit_toggle_key"]
-        new_cfg["openai_system_prompt"] = system_prompt_text.get("1.0", "end").strip() or DEFAULT_CONFIG["openai_system_prompt"]
-        new_cfg["openai_developer_prompt"] = developer_prompt_text.get("1.0", "end").strip() or DEFAULT_CONFIG["openai_developer_prompt"]
-        new_cfg["openai_user_prompt_template"] = user_prompt_text.get("1.0", "end").strip() or DEFAULT_CONFIG["openai_user_prompt_template"]
+        _store_active_prompt_profile()
+        for prompt_profile, prompt_sections in prompt_sections_by_profile.items():
+            _save_prompt_markdown(new_cfg, prompt_profile, prompt_sections)
+        dev_prompt_sections = prompt_sections_by_profile.get("dev") or _load_prompt_markdown(new_cfg, "dev")
+        new_cfg["openai_system_prompt"] = dev_prompt_sections.get("system") or DEFAULT_CONFIG["openai_system_prompt"]
+        new_cfg["openai_developer_prompt"] = dev_prompt_sections.get("developer") or DEFAULT_CONFIG["openai_developer_prompt"]
+        new_cfg["openai_user_prompt_template"] = dev_prompt_sections.get("user") or DEFAULT_CONFIG["openai_user_prompt_template"]
         new_cfg["live_mode"]   = new_cfg["main_live_mode"]
         new_cfg["simple_mode"] = new_cfg["main_simple_mode"]
         _current_config[0] = new_cfg
@@ -4804,27 +4873,10 @@ def run_tray(config_holder: list[dict]):
             threading.Thread(target=_watch_hold, daemon=True).start()
         except Exception as exc:
             _native_hotkeys = None
-            print(f"[TRAY] Native helper unavailable ({exc}); falling back to keyboard library.", flush=True)
-            try:
-                keyboard.add_hotkey(hotkey_str, lambda: _on_hotkey("ptt", "auto", "main"), suppress=True)
-                print(f"[TRAY] Hotkey registered: {hotkey_str}", flush=True)
-            except Exception as hotkey_exc:
-                print(f"[TRAY] ERROR registering hotkey {hotkey_str!r}: {hotkey_exc}", flush=True)
-                print("[TRAY] Try running as Administrator or choose a different hotkey.", flush=True)
-
-            if fast_hotkey_str:
-                try:
-                    keyboard.add_hotkey(fast_hotkey_str, lambda: _on_hotkey("fast_ptt", "paste_ctrl_v", "fast"), suppress=True)
-                    print(f"[TRAY] Fast hotkey registered: {fast_hotkey_str}", flush=True)
-                except Exception as fast_exc:
-                    print(f"[TRAY] ERROR registering fast hotkey {fast_hotkey_str!r}: {fast_exc}", flush=True)
-
-            if undo_str:
-                try:
-                    keyboard.add_hotkey(undo_str, reinsert_last_transcription, suppress=True)
-                    print(f"[TRAY] Last-result hotkey registered: {undo_str}", flush=True)
-                except Exception as undo_exc:
-                    print(f"[TRAY] ERROR registering last-result hotkey {undo_str!r}: {undo_exc}", flush=True)
+            raise RuntimeError(
+                "Native hotkey helper is required but unavailable. "
+                "Run build.bat with the .NET 8 SDK installed, or place HotkeyHelper.exe next to the app."
+            ) from exc
 
     _bind_hotkeys()
 
