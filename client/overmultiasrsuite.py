@@ -16,6 +16,7 @@ import subprocess
 import sys
 import threading
 import time
+import audioop
 from pathlib import Path
 
 # ── Paths (frozen-exe aware) ──────────────────────────────────────────────────
@@ -1266,16 +1267,31 @@ def _device_sample_rate(device) -> int | None:
 
 def _resample_audio(audio: np.ndarray, from_sr: int, to_sr: int) -> np.ndarray:
     """Resample int16 audio array (shape N×1 or N,) via linear interpolation."""
+    mono = np.asarray(audio, dtype=np.int16).reshape(-1, 1)
     if from_sr == to_sr:
-        return audio
-    flat  = audio.flatten().astype(np.float64)
-    n_out = max(1, int(round(len(flat) * to_sr / from_sr)))
-    out   = np.interp(
-        np.linspace(0, len(flat) - 1, n_out),
-        np.arange(len(flat)),
-        flat,
+        return mono
+    if from_sr % to_sr == 0:
+        factor = from_sr // to_sr
+        taps = max(31, factor * 32 + 1)
+        if taps % 2 == 0:
+            taps += 1
+        n = np.arange(taps) - (taps - 1) / 2
+        cutoff = 0.45 / factor
+        kernel = 2 * cutoff * np.sinc(2 * cutoff * n)
+        kernel *= np.hamming(taps)
+        kernel /= np.sum(kernel)
+        filtered = np.convolve(mono.reshape(-1).astype(np.float64), kernel, mode="same")
+        decimated = filtered[::factor]
+        return np.clip(decimated, -32768, 32767).astype(np.int16).reshape(-1, 1)
+    converted, _state = audioop.ratecv(
+        np.ascontiguousarray(mono.reshape(-1)).tobytes(),
+        2,
+        1,
+        int(from_sr),
+        int(to_sr),
+        None,
     )
-    return np.clip(out, -32768, 32767).astype(np.int16).reshape(-1, 1)
+    return np.frombuffer(converted, dtype=np.int16).copy().reshape(-1, 1)
 
 
 def _record_with_vad(
@@ -1315,25 +1331,22 @@ def _record_with_vad(
     if native_sr != target_sr:
         print(f"[REC] Device native {native_sr} Hz -> resampling to {target_sr} Hz", flush=True)
 
-    BLOCK        = 512
-    SIL_BLKS     = max(1, int(sil_secs   * native_sr / BLOCK))
-    SPEECH_BLKS  = max(1, int(min_speech * native_sr / BLOCK))
-    MIN_BLKS     = max(1, int(0.3        * native_sr / BLOCK))
-    # Hangover: how long to stay in "speech" state after the last loud block.
-    # Bridges natural inter-word gaps so they don't restart the silence counter.
-    HANGOVER_BLKS = max(1, int(config.get("vad_hangover_s", 0.3) * native_sr / BLOCK))
+    SIL_SAMPLES      = max(1, int(sil_secs * native_sr))
+    SPEECH_SAMPLES   = max(1, int(min_speech * native_sr))
+    MIN_SAMPLES      = max(1, int(0.3 * native_sr))
+    HANGOVER_SAMPLES = max(1, int(config.get("vad_hangover_s", 0.3) * native_sr))
 
     pending:    list[tuple[list, threading.Event]] = []
     all_data:   list[np.ndarray] = []
     current:    list[np.ndarray] = []
-    spk         = 0          # total blocks since last chunk reset
+    spk         = 0          # total samples since last chunk reset
     chunk_peak  = 0.0        # peak RMS in current (unsent) chunk
     rms_min     = float("inf")
     rms_max     = 0.0
     # Hysteresis state machine
     in_speech   = False      # True while voice (or hangover) is active
-    hangover    = 0          # remaining hangover blocks
-    sil_count   = 0          # consecutive silence blocks after hangover expires
+    hangover    = 0          # remaining hangover samples
+    sil_count   = 0          # consecutive silence samples after hangover expires
 
     def _submit(audio: np.ndarray):
         resampled = _resample_audio(audio, native_sr, target_sr)
@@ -1387,10 +1400,76 @@ def _record_with_vad(
             except Exception as exc:
                 print(f"[POST] Failed to suppress toggle key {toggle_key.upper()}: {_safe_console_text(exc)}", flush=True)
 
-        with sd.InputStream(device=device, samplerate=native_sr, channels=1,
-                            dtype="int16", blocksize=BLOCK) as stream:
-            print("[REC] Recording (VAD)...", flush=True)
-            while (_native_hotkeys.is_pressed(hotkey_name) if _native_hotkeys else keyboard.is_pressed(config["hotkey"])):
+        max_record_s = max(1.0, float(max_chunk_s))
+        max_record_samples = max(1, int(max_record_s * native_sr))
+        print(
+            f"[REC] Recording (single sd.rec buffer at {native_sr} Hz, max {max_record_s:.1f}s)...",
+            flush=True,
+        )
+        started_at = time.time()
+        recording = sd.rec(
+            max_record_samples,
+            samplerate=native_sr,
+            channels=1,
+            dtype="int16",
+            device=device,
+        )
+        reached_limit = False
+        while (_native_hotkeys.is_pressed(hotkey_name) if _native_hotkeys else keyboard.is_pressed(config["hotkey"])):
+            y_down = False
+            if toggle_enabled:
+                try:
+                    y_down = keyboard.is_pressed(toggle_key)
+                except Exception:
+                    y_down = False
+                if y_down and not toggle_y_down:
+                    post_edit_active = _next_post_edit_profile(post_edit_active)
+                    state_label = post_edit_active.upper() if post_edit_active else "OFF"
+                    print(
+                        f"[POST] Session post-edit profile set to {state_label} via {toggle_key.upper()}.",
+                        flush=True,
+                    )
+                    try:
+                        on_post_edit_toggle(post_edit_active)
+                    except Exception:
+                        pass
+            toggle_y_down = y_down
+
+            if time.time() - started_at >= max_record_s:
+                reached_limit = True
+                break
+            time.sleep(0.02)
+
+        elapsed_s = min(max(0.0, time.time() - started_at), max_record_s)
+        if reached_limit:
+            sd.wait()
+        else:
+            sd.stop()
+        used_samples = min(max_record_samples, max(0, int(elapsed_s * native_sr)))
+        if used_samples:
+            raw_capture = recording[:used_samples].copy()
+            all_data.append(raw_capture)
+            current.append(raw_capture)
+            analysis_block_samples = max(1, int(0.10 * native_sr))
+            analysis_blocks = max(1, int(np.ceil(len(raw_capture) / analysis_block_samples)))
+            for blk in np.array_split(raw_capture, analysis_blocks):
+                if len(blk) == 0:
+                    continue
+                rms = float(np.sqrt(np.mean(blk.astype(np.float64) ** 2)))
+                if rms < rms_min:
+                    rms_min = rms
+                if rms > rms_max:
+                    rms_max = rms
+                chunk_peak = max(chunk_peak, rms)
+                spk += len(blk)
+        else:
+            print("[REC] No samples captured before hotkey release.", flush=True)
+
+        skip_legacy_chunk_recorder = True
+        rec_chunk_samples = max(512, int(0.10 * native_sr))
+        if not skip_legacy_chunk_recorder:
+            print(f"[REC] Recording (VAD, sd.rec chunks at {native_sr} Hz)...", flush=True)
+        while (not skip_legacy_chunk_recorder) and (_native_hotkeys.is_pressed(hotkey_name) if _native_hotkeys else keyboard.is_pressed(config["hotkey"])):
                 y_down = False
                 if toggle_enabled:
                     try:
@@ -1410,36 +1489,44 @@ def _record_with_vad(
                             pass
                 toggle_y_down = y_down
 
-                data, _ = stream.read(BLOCK)
+                data = sd.rec(
+                    rec_chunk_samples,
+                    samplerate=native_sr,
+                    channels=1,
+                    dtype="int16",
+                    device=device,
+                )
+                sd.wait()
                 blk = data.copy()
+                frames = len(blk)
                 all_data.append(blk)
                 current.append(blk)
                 rms = float(np.sqrt(np.mean(blk.astype(np.float64) ** 2)))
                 if rms < rms_min: rms_min = rms
                 if rms > rms_max: rms_max = rms
-                spk += 1
+                spk += frames
 
                 if rms >= sil_rms:
                     # Loud block — enter / stay in speech; reset hangover & silence
                     chunk_peak = max(chunk_peak, rms)
                     in_speech  = True
-                    hangover   = HANGOVER_BLKS
+                    hangover   = HANGOVER_SAMPLES
                     sil_count  = 0
                 else:
                     if hangover > 0:
                         # Within hangover window — treat as speech, don't count silence
-                        hangover  -= 1
+                        hangover  = max(0, hangover - frames)
                         sil_count  = 0
                     else:
                         # Genuinely silent
                         in_speech = False
-                        sil_count += 1
+                        sil_count += frames
 
                 if config.get("debug"):
                     print(f"[VAD] rms={rms:.0f} speech={in_speech} hang={hangover} "
-                          f"sil={sil_count}/{SIL_BLKS} peak={chunk_peak:.0f}", flush=True)
+                          f"sil={sil_count}/{SIL_SAMPLES} peak={chunk_peak:.0f}", flush=True)
 
-                if sil_count >= SIL_BLKS and spk >= SPEECH_BLKS and current:
+                if sil_count >= SIL_SAMPLES and spk >= SPEECH_SAMPLES and current:
                     if chunk_peak >= sil_rms:
                         # Real speech detected in this chunk → send it
                         _submit(np.concatenate(current))
@@ -1447,16 +1534,21 @@ def _record_with_vad(
                     else:
                         # No speech reached the threshold — carry tail so a soft
                         # speech onset in the next chunk isn't lost.
-                        tail_blks = SIL_BLKS
-                        if len(current) > tail_blks:
-                            current = current[-tail_blks:]
+                        kept = []
+                        kept_samples = 0
+                        for block in reversed(current):
+                            kept.insert(0, block)
+                            kept_samples += len(block)
+                            if kept_samples >= SIL_SAMPLES:
+                                break
+                        current = kept
                         print(f"[VAD] Silence window, no speech "
                               f"(peak={chunk_peak:.0f} < {sil_rms}) "
                               f"- carrying tail forward", flush=True)
                     _reset_chunk()
 
                 # ── Max chunk duration guard ───────────────────────────────
-                chunk_dur = len(current) * BLOCK / native_sr
+                chunk_dur = sum(len(block) for block in current) / native_sr
                 if chunk_dur >= max_chunk_s and chunk_peak >= sil_rms:
                     print(f"[VAD] Max chunk duration {max_chunk_s}s reached - sending", flush=True)
                     _submit(np.concatenate(current))
@@ -1464,7 +1556,7 @@ def _record_with_vad(
                     _reset_chunk()
     except Exception as exc:
         print(f"[REC] Stream error: {exc}", flush=True)
-        return None, [], None, post_edit_active
+        return None, [], None, post_edit_active, None, native_sr
     finally:
         for hook in (toggle_press_hook, toggle_release_hook):
             if hook is not None:
@@ -1476,13 +1568,13 @@ def _record_with_vad(
     print(f"[REC] Hotkey released. RMS min={rms_min:.0f}  max={rms_max:.0f}  "
           f"silence-threshold={sil_rms}  chunks-sent={len(pending)}", flush=True)
 
-    if len(all_data) < MIN_BLKS and not pending:
+    if sum(len(block) for block in all_data) < MIN_SAMPLES and not pending:
         print("[REC] Too short, ignoring.", flush=True)
-        return None, [], None, post_edit_active
+        return None, [], None, post_edit_active, None, native_sr
     soft_floor = max(120.0, sil_rms * 0.35)
     if not pending and rms_max < soft_floor:
         print(f"[REC] No meaningful speech detected (max={rms_max:.0f} < soft floor {soft_floor:.0f}), ignoring.", flush=True)
-        return None, [], None, post_edit_active
+        return None, [], None, post_edit_active, None, native_sr
     if not pending and rms_max < sil_rms:
         print(f"[REC] Soft speech stayed below VAD threshold (max={rms_max:.0f} < {sil_rms}) - transcribing anyway.", flush=True)
 
@@ -1496,7 +1588,7 @@ def _record_with_vad(
     if remaining is not None and len(remaining) < int(0.3 * target_sr) and pending:
         remaining = None
 
-    return full_audio, pending, remaining, post_edit_active
+    return full_audio, pending, remaining, post_edit_active, raw_full, native_sr
 
 
 # ── Transcription ─────────────────────────────────────────────────────────────
@@ -1810,11 +1902,12 @@ def transcribe(audio: np.ndarray, config: dict) -> tuple[str | None, str | None]
     return _post_wav_bytes(buf.getvalue(), config)
 
 
-def _save_failed_wav(audio: np.ndarray, sr: int) -> Path:
+def _save_failed_wav(audio: np.ndarray, sr: int, label: str = "failed") -> Path:
     """Write audio to the failed_audio/ directory and return the path."""
     FAILED_AUDIO_DIR.mkdir(exist_ok=True)
     ts   = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    path = FAILED_AUDIO_DIR / f"failed_{ts}.wav"
+    safe_label = re.sub(r"[^A-Za-z0-9_-]+", "_", label).strip("_") or "failed"
+    path = FAILED_AUDIO_DIR / f"{safe_label}_{ts}.wav"
     sf.write(str(path), audio, sr, subtype="PCM_16")
     print(f"[FAILED] WAV saved: {path}", flush=True)
     return path
@@ -2909,7 +3002,7 @@ def run_session(
                     ordered = [chunk_results[i] for i in sorted(chunk_results)]
                 _set_preview(text=_join_chunks(ordered))
 
-            full_audio, pending, remaining, post_edit_active = _record_with_vad(
+            full_audio, pending, remaining, post_edit_active, raw_full_audio, native_sr = _record_with_vad(
                 config,
                 on_chunk_ready=_on_classic_chunk,
                 hotkey_name=hotkey_name,
@@ -3025,8 +3118,10 @@ def run_session(
             elif error:
                 history_entry = {"time": _now_str(), "text": None, "error": error}
                 if _should_save_failed_wav(error):
-                    wav_path = _save_failed_wav(full_audio, config.get("sample_rate", 16000))
+                    wav_path = _save_failed_wav(full_audio, config.get("sample_rate", 16000), "failed_resampled")
                     history_entry["wav"] = str(wav_path)
+                    if raw_full_audio is not None:
+                        history_entry["raw_wav"] = str(_save_failed_wav(raw_full_audio, native_sr, "failed_native"))
                 _add_to_history(history_entry)
                 _hide_preview_overlay()
                 print(f"[TYPE] Error — typing message for 5 s: {error!r}", flush=True)
@@ -3083,7 +3178,7 @@ def run_session(
             else:
                 print("[STATUS] Listening", flush=True)
 
-            full_audio, pending, remaining, post_edit_active = _record_with_vad(
+            full_audio, pending, remaining, post_edit_active, raw_full_audio, native_sr = _record_with_vad(
                 config,
                 hotkey_name=hotkey_name,
                 post_edit_active=post_edit_active,
@@ -3206,8 +3301,10 @@ def run_session(
             elif error:
                 history_entry = {"time": _now_str(), "text": None, "error": error}
                 if _should_save_failed_wav(error):
-                    wav_path = _save_failed_wav(full_audio, config.get("sample_rate", 16000))
+                    wav_path = _save_failed_wav(full_audio, config.get("sample_rate", 16000), "failed_resampled")
                     history_entry["wav"] = str(wav_path)
+                    if raw_full_audio is not None:
+                        history_entry["raw_wav"] = str(_save_failed_wav(raw_full_audio, native_sr, "failed_native"))
                 _add_to_history(history_entry)
                 print(f"[TYPE] Error — typing message for 5 s: {error!r}", flush=True)
                 type_text(error)
@@ -3263,7 +3360,7 @@ def run_session(
             _set_overlay(_OVL_RECORDING)
             print("[STATUS] Listening (live)", flush=True)
 
-            full_audio, pending, remaining, _ = _record_with_vad(
+            full_audio, pending, remaining, _, raw_full_audio, native_sr = _record_with_vad(
                 config,
                 on_chunk_ready=_on_chunk_during_hold,
                 hotkey_name=hotkey_name,
@@ -3360,8 +3457,10 @@ def run_session(
             elif error:
                 history_entry = {"time": _now_str(), "text": None, "error": error}
                 if _should_save_failed_wav(error):
-                    wav_path = _save_failed_wav(full_audio, config.get("sample_rate", 16000))
+                    wav_path = _save_failed_wav(full_audio, config.get("sample_rate", 16000), "failed_resampled")
                     history_entry["wav"] = str(wav_path)
+                    if raw_full_audio is not None:
+                        history_entry["raw_wav"] = str(_save_failed_wav(raw_full_audio, native_sr, "failed_native"))
                 _add_to_history(history_entry)
                 print(f"[TYPE] Error — typing message for 5 s: {error!r}", flush=True)
                 type_text(error)
