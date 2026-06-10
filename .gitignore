@@ -3,13 +3,14 @@ server/.venv-sherpa/
 server/.venv-sherpa-cuda*/
 server/models/
 post-editor-proxy/.venv-post-editor/
+post-editor-proxy/.venv/
 post-editor-proxy/.env
 post-editor-proxy/post_editor_prompt.md
 client/dist/*
 !client/dist/
 client/build/
 client/OverMultiASRSuite.exe
-client/HotkeyHelper.exe
+!client/HotkeyHelper.exe
 client/config.json
 client/.venv/
 client/native_hotkey_helper/bin/
