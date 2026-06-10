@@ -1,4 +1,7 @@
 server/.venv/
+server/.venv-sherpa/
+server/.venv-sherpa-cuda*/
+server/models/
 client/dist/*
 !client/dist/
 client/build/

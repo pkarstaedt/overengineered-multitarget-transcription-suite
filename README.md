@@ -130,7 +130,7 @@ In practice, the minimum viable successful response is:
 
 If the server returns a non-2xx status, invalid JSON, or a payload without usable text, the client treats the request as failed and shows/logs an error instead of inserting text.
 
-The client is tested against [faster-whisper-server](https://github.com/fedirz/faster-whisper-server) and the local [Parakeet server](#local-parakeet-server) included in this repo. Any server with the same API shape works.
+The client is tested against [faster-whisper-server](https://github.com/fedirz/faster-whisper-server) and the local [Parakeet server options](#local-parakeet-server-options) included in this repo. Any server with the same API shape works.
 
 ---
 
@@ -170,6 +170,52 @@ For console/debug runs:
 ```bat
 .venv\Scripts\python overmultiasrsuite.py
 ```
+
+### Local Server Quick Start
+
+The `server/` directory contains multiple `/transcribe` implementations with
+the same HTTP contract. The client does not care which one is behind the URL.
+
+Recommended Linux path for constrained machines:
+
+```bash
+cd server
+./install_sherpa_onnx.sh
+./run_sherpa_onnx.sh
+```
+
+This runs the converted Sherpa-ONNX Parakeet TDT 0.6B v3 int8 model. It is
+CPU-first by default and avoids the NeMo/PyTorch dependency stack.
+
+GPU Sherpa-ONNX on a CUDA 12 / cuDNN 9 Linux host:
+
+```bash
+cd server
+VENV_DIR=.venv-sherpa-cuda12 SHERPA_MODE=cuda12 ./install_sherpa_onnx.sh
+VENV_DIR=.venv-sherpa-cuda12 PROVIDER=cuda ./run_sherpa_onnx.sh
+```
+
+Original NeMo/PyTorch Parakeet server:
+
+```bash
+cd server
+./install.sh
+./run.sh
+```
+
+This runs the original NVIDIA/Hugging Face Parakeet model through NeMo. It can
+be excellent on a compatible CUDA machine, but it is more fragile to install.
+
+Windows NeMo server:
+
+```bat
+cd server
+install.bat
+run.bat
+```
+
+See [Local Parakeet server options](#local-parakeet-server-options) for the full
+runtime matrix and install details.
 
 If you want to use LLM post-editing, set the OpenAI key through the environment instead of `config.json`:
 
@@ -519,9 +565,21 @@ When running from source, output goes to the terminal. Enable `"debug": true` in
 
 ---
 
-## Local Parakeet server
+## Local Parakeet Server Options
 
-`server/` contains an alternative transcription server using NVIDIA's [Parakeet TDT 0.6B v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) model. It exposes the exact same `/transcribe` API so the client can be pointed at it with a one-line config change.
+`server/` contains local transcription servers using NVIDIA's [Parakeet TDT 0.6B v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) model family. Every server exposes the exact same `/transcribe` API, so the client can be pointed at any of them with a one-line config change.
+
+### Server matrix
+
+| Server | Model package | Runtime backend | Best fit | Status |
+|---|---|---|---|---|
+| `sherpa_onnx_server.py` | `sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8` | Sherpa-ONNX / ONNX Runtime style runtime | Linux machines where a small, low-drama local server matters more than GPU use | Recommended default |
+| `parakeet_server.py` | `nvidia/parakeet-tdt-0.6b-v3` | NVIDIA NeMo + PyTorch | CUDA machines where the NeMo stack is already known-good | Original server |
+| Any external `/transcribe` server | Any compatible ASR model | Anything | Existing faster-whisper, cloud, or custom ASR endpoints | Supported by contract |
+
+The ONNX server still runs Parakeet TDT 0.6B v3, but it runs a converted int8
+Sherpa-ONNX package instead of loading the original Hugging Face model through
+NeMo.
 
 **Parakeet TDT 0.6B v3 vs. Whisper large-v3**
 
@@ -535,18 +593,85 @@ When running from source, output goes to the terminal. Enable `"debug": true` in
 
 Worth trying if you want a smaller local model with low latency while keeping the same simple HTTP contract.
 
-### VRAM note
+### Runtime notes
 
-On this project, the practical GPU memory picture has been:
+The NeMo/PyTorch server is the most sensitive to CUDA, Torch, and Torchaudio
+compatibility. On older Pascal GPUs such as GTX 1060/1080-class cards (`sm_61`),
+newer PyTorch CUDA wheels may install successfully but fail at runtime because
+they no longer include compatible kernels. NeMo dependency resolution can also
+upgrade a working Torch/Torchaudio pair into an incompatible one.
+
+The Sherpa-ONNX server avoids PyTorch entirely. On a GTX 1060 Max-Q test
+machine:
+
+- CPU Sherpa-ONNX loaded successfully, used about 1.1 GB resident RAM, and
+  decoded the bundled short English/German test WAVs faster than real time after
+  warmup.
+- CUDA 12 / cuDNN 9 Sherpa-ONNX loaded successfully with `PROVIDER=cuda`, used
+  about 270 MiB GPU memory after warmup, and decoded:
+  - `3.845s` English sample in about `0.64-0.65s`
+  - `2.752s` German sample in about `0.36-0.37s`
+- CUDA 11 Sherpa-ONNX did not load on that CUDA-12-normalized host because
+  `libcublasLt.so.11` was not available.
+
+For the NeMo/PyTorch server, the practical GPU memory picture has been:
 
 - cold start / first real inference: roughly **6 GB VRAM**
 - warm steady-state operation: roughly **3 GB VRAM**
 
 That distinction matters. A machine may have enough VRAM to run Parakeet comfortably once it is warm, but still fail during startup or the first inference if the initial allocation peak does not fit.
 
-Treat these numbers as approximate, hardware- and driver-dependent observations rather than strict guarantees, but they are a useful rule of thumb when deciding whether Parakeet is a good fit for a given GPU.
+Treat these numbers as approximate, hardware- and driver-dependent observations rather than strict guarantees, but they are a useful rule of thumb when deciding whether the NeMo path is a good fit for a given GPU.
 
-### Setup
+### Sherpa-ONNX setup
+
+Requires Python 3.11+ and [uv](https://github.com/astral-sh/uv). CUDA is optional.
+
+```bash
+cd server
+./install_sherpa_onnx.sh
+```
+
+This creates `server/.venv-sherpa`, installs the CPU Sherpa-ONNX wheel by
+default, and downloads the converted Parakeet v3 int8 model into
+`server/models/`.
+
+Run:
+
+```bash
+cd server
+./run_sherpa_onnx.sh
+```
+
+Defaults:
+
+- `PYTHON_BIN=python3.11`
+- `SHERPA_MODE=cpu`
+- `VENV_DIR=.venv-sherpa`
+- `MODEL_DIR=models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8`
+- `HOST=0.0.0.0`
+- `PORT=8001`
+- `PROVIDER=cpu`
+- `NUM_THREADS=2`
+
+CUDA-enabled Sherpa-ONNX wheels can be tried explicitly. On CUDA 12 / cuDNN 9
+hosts, use a separate venv so the CPU fallback stays intact:
+
+```bash
+cd server
+VENV_DIR=.venv-sherpa-cuda12 SHERPA_MODE=cuda12 ./install_sherpa_onnx.sh
+VENV_DIR=.venv-sherpa-cuda12 PROVIDER=cuda ./run_sherpa_onnx.sh
+```
+
+CUDA 11 can be tried on CUDA 11 hosts:
+
+```bash
+cd server
+VENV_DIR=.venv-sherpa-cuda11 SHERPA_MODE=cuda11 ./install_sherpa_onnx.sh
+VENV_DIR=.venv-sherpa-cuda11 PROVIDER=cuda ./run_sherpa_onnx.sh
+```
+
+### NeMo/PyTorch setup
 
 Requires Python 3.11+, [uv](https://github.com/astral-sh/uv), and a CUDA-capable GPU.
 
@@ -559,24 +684,46 @@ This installs PyTorch and NeMo. The Parakeet model is downloaded from HuggingFac
 
 > **Windows note:** NeMo is officially supported on Linux. It generally works on Windows but installation can be fragile. If you hit issues, running the server in WSL2 is the most reliable option.
 
-### Run
+Linux helpers are also available:
 
-```bat
+```bash
 cd server
-run.bat
+./install.sh
+./run.sh
 ```
 
-Server starts on `http://localhost:8001`. Once you see `Model ready`, point the client at it:
+Defaults:
+
+- `PYTHON_BIN=python3.11`
+- `TORCH_VERSION=2.4.1`
+- `TORCHAUDIO_VERSION=2.4.1`
+- `TORCH_INDEX_URL=https://download.pytorch.org/whl/cu121`
+- `HOST=0.0.0.0`
+- `PORT=8001`
+- `DEVICE=cuda`
+
+Override them with environment variables when needed:
+
+```bash
+PYTHON_BIN=python3.11 TORCH_VERSION=2.4.1 TORCHAUDIO_VERSION=2.4.1 TORCH_INDEX_URL=https://download.pytorch.org/whl/cu121 ./install.sh
+HOST=127.0.0.1 PORT=8001 DEVICE=cpu ./run.sh
+```
+
+### Client configuration
+
+All local server variants start on `http://localhost:8001` by default. Once
+`GET /health` reports the model is loaded, point the client at it:
 
 ```json
 { "server_url": "http://localhost:8001/transcribe" }
 ```
 
-### Options
+### Direct server options
 
 ```
 python parakeet_server.py --host 0.0.0.0 --port 8001 --device cuda
 python parakeet_server.py --device cpu   # slower, no GPU required
+python sherpa_onnx_server.py --host 0.0.0.0 --port 8001 --provider cpu
 ```
 
 `GET /health` returns `{"status": "ok", "model_loaded": true}` once the model is ready.
@@ -633,8 +780,14 @@ client/
   dist/                 PyInstaller build output
 
 server/
-  parakeet_server.py    Local Parakeet TDT 0.6B v3 transcription server
-  requirements.txt      Server dependencies
-  install.bat           First-time setup
-  run.bat               Start the server
+  README.md             Server runtime matrix and setup notes
+  parakeet_server.py    Original NeMo/PyTorch Parakeet TDT 0.6B v3 server
+  sherpa_onnx_server.py Sherpa-ONNX Parakeet TDT 0.6B v3 int8 server
+  requirements.txt      NeMo/PyTorch server dependencies
+  install.bat           Windows NeMo setup
+  run.bat               Windows NeMo runner
+  install.sh            Linux NeMo setup
+  run.sh                Linux NeMo runner
+  install_sherpa_onnx.sh Linux Sherpa-ONNX setup
+  run_sherpa_onnx.sh    Linux Sherpa-ONNX runner
 ```
