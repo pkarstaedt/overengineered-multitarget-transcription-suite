@@ -21,8 +21,9 @@ POST_EDITOR_MODEL="${POST_EDITOR_MODEL:-qwen3:1.7b}"
 POST_EDITOR_PROMPT_FILE="${POST_EDITOR_PROMPT_FILE:-post_editor_prompt.md}"
 POST_EDITOR_THINK="${POST_EDITOR_THINK:-false}"
 POST_EDITOR_MIN_EDIT_CHARS="${POST_EDITOR_MIN_EDIT_CHARS:-0}"
+POST_EDITOR_LOG_TEXT="${POST_EDITOR_LOG_TEXT:-true}"
 
-export HOST PORT POST_EDITOR_UPSTREAM_URL POST_EDITOR_OLLAMA_URL POST_EDITOR_MODEL POST_EDITOR_PROMPT_FILE POST_EDITOR_THINK POST_EDITOR_MIN_EDIT_CHARS
+export HOST PORT POST_EDITOR_UPSTREAM_URL POST_EDITOR_OLLAMA_URL POST_EDITOR_MODEL POST_EDITOR_PROMPT_FILE POST_EDITOR_THINK POST_EDITOR_MIN_EDIT_CHARS POST_EDITOR_LOG_TEXT
 
 if [ ! -x "$VENV_DIR/bin/python" ]; then
   echo "[run-post-editor] missing $VENV_DIR. Run ./install.sh first." >&2
@@ -35,4 +36,5 @@ echo "[run-post-editor] model=${POST_EDITOR_MODEL} ollama=${POST_EDITOR_OLLAMA_U
 echo "[run-post-editor] think=${POST_EDITOR_THINK}"
 echo "[run-post-editor] min_edit_chars=${POST_EDITOR_MIN_EDIT_CHARS}"
 echo "[run-post-editor] prompt_file=${POST_EDITOR_PROMPT_FILE}"
+echo "[run-post-editor] log_text=${POST_EDITOR_LOG_TEXT}"
 exec "$VENV_DIR/bin/python" post_editor_proxy.py --host "$HOST" --port "$PORT"

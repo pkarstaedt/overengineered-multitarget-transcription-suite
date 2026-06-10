@@ -84,6 +84,7 @@ parser.add_argument("--num-ctx", default=int(os.getenv("POST_EDITOR_NUM_CTX", "4
 parser.add_argument("--keep-alive", default=os.getenv("POST_EDITOR_KEEP_ALIVE", "30m"))
 parser.add_argument("--think", action="store_true", default=os.getenv("POST_EDITOR_THINK", "").lower() in {"1", "true", "yes"})
 parser.add_argument("--min-edit-chars", default=int(os.getenv("POST_EDITOR_MIN_EDIT_CHARS", "0")), type=int)
+parser.add_argument("--log-text", action="store_true", default=os.getenv("POST_EDITOR_LOG_TEXT", "true").lower() in {"1", "true", "yes"})
 parser.add_argument("--disable-edit", action="store_true", default=os.getenv("POST_EDITOR_DISABLE_EDIT", "").lower() in {"1", "true", "yes"})
 args, _ = parser.parse_known_args()
 
@@ -133,6 +134,39 @@ def _json_from_ollama_response(payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(content, str):
         raise ValueError("Ollama response did not contain string content")
     return json.loads(content)
+
+
+def _log_result(
+    raw_text: str,
+    edited_text: str,
+    editor_notes: str,
+    post_editor: dict[str, Any],
+) -> None:
+    status = post_editor.get("status")
+    if status == "skipped_below_min_chars":
+        return
+    if not args.log_text:
+        print(
+            f"[POST-EDITOR] ASR {post_editor['upstream_ms']} ms | "
+            f"edit {post_editor['post_edit_total_ms']} ms | "
+            f"total {post_editor['total_ms']} ms | status {status}",
+            flush=True,
+        )
+        return
+
+    print("\nRaw transcript:", flush=True)
+    print(raw_text or "<empty>", flush=True)
+    print("\nEdited transcript:", flush=True)
+    print(edited_text or "<empty>", flush=True)
+    if editor_notes:
+        print("\nEditor notes:", flush=True)
+        print(editor_notes, flush=True)
+    print(
+        f"\nTiming: ASR {post_editor['upstream_ms']} ms | "
+        f"edit {post_editor['post_edit_total_ms']} ms | "
+        f"total {post_editor['total_ms']} ms | status {status}\n",
+        flush=True,
+    )
 
 
 async def _post_edit(raw_text: str, language: str | None) -> tuple[str, str, dict[str, Any]]:
@@ -257,12 +291,7 @@ async def transcribe(
         "language": language,
         "response": response,
     }
-    status = response["post_editor"].get("status")
-    print(
-        f"[POST-EDITOR] upstream={upstream_ms}ms edit={edit_ms}ms status={status} "
-        f"raw_len={len(raw_text)} edited_len={len(edited_text)}",
-        flush=True,
-    )
+    _log_result(raw_text, edited_text, editor_notes, response["post_editor"])
     return JSONResponse(response)
 
 
@@ -289,6 +318,7 @@ async def health():
         "model": args.model,
         "thinking_enabled": args.think,
         "min_edit_chars": args.min_edit_chars,
+        "log_text": args.log_text,
         "prompt_file": args.prompt_file,
     }
 

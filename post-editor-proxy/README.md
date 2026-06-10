@@ -83,6 +83,7 @@ Common local settings:
 POST_EDITOR_PROMPT_FILE=post_editor_prompt.md
 POST_EDITOR_THINK=false
 POST_EDITOR_MIN_EDIT_CHARS=120
+POST_EDITOR_LOG_TEXT=true
 OLLAMA_CHAT_THINK=true
 ```
 
@@ -94,6 +95,7 @@ OLLAMA_CHAT_THINK=true
 | `POST_EDITOR_PROMPT_FILE` | `post_editor_prompt.md` | Editable prompt file |
 | `POST_EDITOR_THINK` | `false` | Enable Qwen3 thinking mode; keep `false` for low-latency cleanup |
 | `POST_EDITOR_MIN_EDIT_CHARS` | `0` | Skip Ollama cleanup for transcripts shorter than this many characters |
+| `POST_EDITOR_LOG_TEXT` | `true` | Print raw and edited transcripts to stdout for debugging |
 | `POST_EDITOR_DISABLE_EDIT` | unset | Set to `true` to forward raw ASR text without cleanup |
 | `POST_EDITOR_NUM_CTX` | `4096` | Ollama context size |
 | `POST_EDITOR_KEEP_ALIVE` | `30m` | How long Ollama keeps the model loaded |
@@ -109,6 +111,9 @@ POST_EDITOR_MIN_EDIT_CHARS=120 ./run.sh
 
 When bypassed, the proxy returns the raw ASR text unchanged and sets
 `post_editor.status` to `skipped_below_min_chars`.
+
+By default, each request prints timing plus the raw and edited transcript to
+stdout. Set `POST_EDITOR_LOG_TEXT=false` to keep only the compact timing line.
 
 ## Interactive Chat
 
