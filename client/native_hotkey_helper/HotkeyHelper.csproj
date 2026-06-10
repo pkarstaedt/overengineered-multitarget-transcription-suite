@@ -6,5 +6,7 @@
     <Nullable>enable</Nullable>
     <AssemblyName>HotkeyHelper</AssemblyName>
     <RootNamespace>HotkeyHelper</RootNamespace>
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
   </PropertyGroup>
 </Project>
