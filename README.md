@@ -217,6 +217,17 @@ run.bat
 See [Local Parakeet server options](#local-parakeet-server-options) for the full
 runtime matrix and install details.
 
+Optional post-editor proxy:
+
+```bash
+cd post-editor-proxy
+./install.sh
+POST_EDITOR_MODEL=qwen3:1.7b ./run.sh
+```
+
+Run it in front of any `/transcribe` backend to clean ASR text through a local
+Ollama model while preserving the same client-facing HTTP contract.
+
 If you want to use LLM post-editing, set the OpenAI key through the environment instead of `config.json`:
 
 ```powershell
@@ -718,6 +729,66 @@ All local server variants start on `http://localhost:8001` by default. Once
 { "server_url": "http://localhost:8001/transcribe" }
 ```
 
+If the post-editor proxy is running, point the client at the proxy instead:
+
+```json
+{ "server_url": "http://localhost:8010/transcribe" }
+```
+
+### Post-editor proxy
+
+The post-editor proxy is a small drop-in middleware that forwards audio to an
+actual ASR backend, sends the returned transcript through a local Ollama model,
+and returns the cleaned text using the same `/transcribe` response shape:
+
+```text
+client -> post-editor-proxy -> ASR backend -> Ollama cleanup -> client
+```
+
+Install:
+
+```bash
+cd post-editor-proxy
+./install.sh
+```
+
+Run with the default upstream `http://127.0.0.1:8001/transcribe` and default
+cleanup model `qwen3:1.7b`:
+
+```bash
+cd post-editor-proxy
+./run.sh
+```
+
+Typical chain with the CUDA Sherpa-ONNX ASR server:
+
+```bash
+cd server
+VENV_DIR=.venv-sherpa-cuda12 PROVIDER=cuda ./run_sherpa_onnx.sh
+
+# In another terminal:
+cd ../post-editor-proxy
+POST_EDITOR_MODEL=qwen3:1.7b ./run.sh
+```
+
+For Qwen3 models, the proxy disables thinking mode by default with
+`POST_EDITOR_THINK=false`. That keeps transcript cleanup closer to a fast edit
+pass instead of a slow reasoning pass. Set `POST_EDITOR_THINK=true` only when
+you explicitly want the model to spend more time reasoning about the transcript.
+Set `POST_EDITOR_MIN_EDIT_CHARS` to skip Ollama cleanup for short transcripts
+that do not need editing.
+
+Prompt management:
+
+- source template: `post-editor-proxy/post_editor_prompt.md.example`
+- local editable prompt: `post-editor-proxy/post_editor_prompt.md`
+- `post-editor-proxy/install.sh` creates the local editable prompt if missing
+- `post-editor-proxy/post_editor_prompt.md` is ignored by git so local prompt experiments do not become source changes
+
+The proxy response adds `raw_text`, `editor_notes`, and `post_editor` diagnostic
+fields so you can inspect what changed. The client still uses the normal `text`
+field.
+
 ### Direct server options
 
 ```
@@ -790,4 +861,16 @@ server/
   run.sh                Linux NeMo runner
   install_sherpa_onnx.sh Linux Sherpa-ONNX setup
   run_sherpa_onnx.sh    Linux Sherpa-ONNX runner
+
+post-editor-proxy/
+  README.md             Proxy setup, prompt, and timing notes
+  .env.example          Public proxy/chat runtime configuration template
+  .env                  Local proxy/chat runtime configuration (auto-created/local-only)
+  post_editor_proxy.py  Drop-in ASR post-editor proxy using Ollama
+  ollama_chat.py        Interactive Ollama chat client
+  post_editor_prompt.md.example Public prompt template
+  post_editor_prompt.md Local editable prompt (auto-created/local-only)
+  install.sh            Linux proxy setup
+  run.sh                Linux proxy runner
+  chat.sh               Interactive chat launcher with reasoning enabled
 ```

@@ -2,6 +2,9 @@ server/.venv/
 server/.venv-sherpa/
 server/.venv-sherpa-cuda*/
 server/models/
+post-editor-proxy/.venv-post-editor/
+post-editor-proxy/.env
+post-editor-proxy/post_editor_prompt.md
 client/dist/*
 !client/dist/
 client/build/
@@ -25,6 +28,7 @@ client/transcription_prompt.md
 client/*_post_edit_prompt.md
 .env
 .env.*
+!post-editor-proxy/.env.example
 *.log
 launch.bat
 launch.ps1

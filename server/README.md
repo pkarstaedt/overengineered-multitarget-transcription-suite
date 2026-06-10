@@ -93,3 +93,9 @@ curl -s -X POST http://127.0.0.1:8001/transcribe \
   -F file=@models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/test_wavs/en.wav \
   -F language=en
 ```
+
+## Post-Editor Proxy
+
+The post-editor proxy is a separate top-level component under
+`post-editor-proxy/`. It can sit in front of any server documented here while
+keeping the same `/transcribe` client contract.
