@@ -353,6 +353,8 @@ while the post-edit prompt can stay focused on stronger restructuring and coding
 | `server_url` | `http://…/transcribe` | Transcription server endpoint |
 | `transcription_backend` | `http` | `http` uses the configured `/transcribe` endpoint. `openai` sends WAV audio directly to OpenAI speech-to-text. |
 | `openai_transcription_model` | `gpt-4o-mini-transcribe` | OpenAI speech-to-text model used when `transcription_backend` is `openai`. |
+| `post_edit_provider` | `openai` | Post-edit backend. `openai` calls the OpenAI Responses API. `external` sends the rendered profile prompt to `external_post_edit_url`. |
+| `external_post_edit_url` | `http://127.0.0.1:8010/external_postedit` | Local/proxy post-edit endpoint used when `post_edit_provider` is `external`. |
 | `hotkey` | `ctrl+shift+space` | Main push-to-talk hotkey. Hold to record, release to transcribe. Insertion is chosen automatically: console-like fields use typed input, normal editors use fast paste. |
 | `fast_hotkey` | `""` | Optional push-to-talk override that always uses fast paste / dump. Empty = disabled. |
 | `undo_hotkey` | `""` | Optional hotkey to re-insert the last successful transcription into the current target using the current insertion logic. Empty = disabled. |
@@ -461,6 +463,12 @@ The tab now maintains two categories:
 - Select an entry and click **Remove Selected** to delete it
 
 To find the class name of an unfamiliar window, focus it and run:
+
+```bat
+.venv\Scripts\python focus_class.py
+```
+
+Or use the same check through the full client entry point:
 
 ```bat
 .venv\Scripts\python overmultiasrsuite.py --focus

@@ -117,6 +117,8 @@ DEFAULT_CONFIG = {
     "fast_simple_mode": True,
     "fast_mode": "preview",
     "fast_post_edit_mode": False,
+    "post_edit_provider": "openai",
+    "external_post_edit_url": "http://127.0.0.1:8010/external_postedit",
     "openai_model": "gpt-5-mini",
     "openai_reasoning_effort": "low",
     "openai_prompt_markdown_file": DEFAULT_PROMPT_FILE,
@@ -485,6 +487,7 @@ class NativeHotkeyBridge:
         self._reader: threading.Thread | None = None
         self._stop = threading.Event()
         self._ready = threading.Event()
+        self.last_error = ""
         self._pressed = {
             "ptt": threading.Event(),
             "fast_ptt": threading.Event(),
@@ -518,7 +521,9 @@ class NativeHotkeyBridge:
         self._reader = threading.Thread(target=self._reader_loop, daemon=True)
         self._reader.start()
         if not self._ready.wait(timeout=5):
-            raise RuntimeError("Hotkey helper did not become ready.")
+            code = self._proc.poll() if self._proc is not None else None
+            detail = self.last_error or (f"exited with code {code}" if code is not None else "no ready signal")
+            raise RuntimeError(f"Hotkey helper did not become ready ({detail}).")
 
     def stop(self):
         self._stop.set()
@@ -549,6 +554,9 @@ class NativeHotkeyBridge:
         ev = self._pressed.get(name)
         return bool(ev and ev.is_set())
 
+    def is_running(self) -> bool:
+        return self._proc is not None and self._proc.poll() is None and self._ready.is_set()
+
     def _reader_loop(self):
         assert self._proc is not None and self._proc.stdout is not None
         for raw_line in self._proc.stdout:
@@ -564,7 +572,8 @@ class NativeHotkeyBridge:
 
         if not self._stop.is_set():
             code = self._proc.poll()
-            print(f"[HOTKEY] Helper exited unexpectedly with code {code}.", flush=True)
+            self.last_error = f"exited unexpectedly with code {code}"
+            print(f"[HOTKEY] Helper {self.last_error}.", flush=True)
 
     def _handle_payload(self, payload: dict):
         kind = payload.get("type")
@@ -574,7 +583,8 @@ class NativeHotkeyBridge:
             return
 
         if kind == "error":
-            print(f"[HOTKEY] ERROR: {payload.get('message', 'unknown error')}", flush=True)
+            self.last_error = str(payload.get("message") or "unknown error")
+            print(f"[HOTKEY] ERROR: {self.last_error}", flush=True)
             return
 
         if kind == "raw":
@@ -1663,20 +1673,22 @@ def _looks_like_prompt_echo(edited_text: str, *, transcript: str, system_prompt:
     return any(marker in edited_norm for marker in suspicious_markers)
 
 
-def _post_edit_text(text: str, config: dict, profile: str, edit_profile: str = "dev") -> tuple[str, str, bool]:
-    api_key = _openai_api_key()
-    model = (config.get("openai_model") or "").strip()
-    edit_profile = _post_edit_profile_name(edit_profile) or "dev"
+POST_EDIT_RESULT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "edited_text": {"type": "string"},
+        "editor_notes": {"type": "string"},
+    },
+    "required": ["edited_text", "editor_notes"],
+    "additionalProperties": False,
+}
+
+
+def _render_post_edit_messages(text: str, config: dict, edit_profile: str) -> tuple[list[dict], dict[str, str]]:
     prompt_sections = _load_prompt_markdown(config, edit_profile)
     system_prompt = prompt_sections.get("system") or ""
     developer_prompt = prompt_sections.get("developer") or ""
     user_prompt_template = prompt_sections.get("user") or ""
-    reasoning_effort = (config.get("openai_reasoning_effort") or "low").strip().lower()
-
-    if not api_key or not model or not user_prompt_template.strip():
-        print("[POST] Post-edit skipped - OpenAI settings incomplete (set OPENAI_API_KEY and LLM settings).", flush=True)
-        return text, "", False
-
     prompt_values = {
         "transcript": text,
         **_recent_transcript_placeholders(),
@@ -1688,45 +1700,85 @@ def _post_edit_text(text: str, config: dict, profile: str, edit_profile: str = "
     rendered_user_prompt = user_prompt_template
     for key, value in prompt_values.items():
         rendered_user_prompt = rendered_user_prompt.replace(f"{{{key}}}", value)
-    input_items = []
+
+    messages = []
     if system_prompt.strip():
-        input_items.append(
-            {
-                "role": "system",
-                "content": [{"type": "input_text", "text": system_prompt}],
-            }
-        )
+        messages.append({"role": "system", "content": system_prompt})
     if rendered_developer_prompt.strip():
-        input_items.append(
-            {
-                "role": "developer",
-                "content": [{"type": "input_text", "text": rendered_developer_prompt}],
-            }
-        )
-    input_items.append(
+        messages.append({"role": "developer", "content": rendered_developer_prompt})
+    if rendered_user_prompt.strip():
+        messages.append({"role": "user", "content": rendered_user_prompt})
+    return messages, {
+        "system_prompt": system_prompt,
+        "developer_prompt": rendered_developer_prompt,
+        "rendered_user_prompt": rendered_user_prompt,
+    }
+
+
+def _openai_input_from_messages(messages: list[dict]) -> list[dict]:
+    return [
         {
-            "role": "user",
-            "content": [{"type": "input_text", "text": rendered_user_prompt}],
+            "role": message.get("role", "user"),
+            "content": [{"type": "input_text", "text": str(message.get("content") or "")}],
         }
-    )
+        for message in messages
+        if str(message.get("content") or "").strip()
+    ]
+
+
+def _validate_post_edit_result(
+    edited: str,
+    editor_notes: str,
+    original_text: str,
+    prompts: dict[str, str],
+) -> tuple[str, str, bool]:
+    edited = (edited or "").strip()
+    editor_notes = (editor_notes or "").strip()
+    if not edited:
+        print("[POST] Empty edited text returned - keeping original transcript.", flush=True)
+        return original_text, editor_notes, False
+    if _looks_like_prompt_echo(
+        edited,
+        transcript=original_text,
+        system_prompt=prompts.get("system_prompt", ""),
+        developer_prompt=prompts.get("developer_prompt", ""),
+        rendered_user_prompt=prompts.get("rendered_user_prompt", ""),
+    ):
+        print("[POST] Edited text looks like prompt echo - keeping original transcript.", flush=True)
+        return original_text, editor_notes, False
+
+    print(f"[POST] Edited text: {_safe_console_text(repr(edited))}", flush=True)
+    if editor_notes:
+        print(f"[POST] Editor notes: {_safe_console_text(repr(editor_notes))}", flush=True)
+    print("[POST] Post-edit complete.", flush=True)
+    return edited, editor_notes, True
+
+
+def _post_edit_text_openai(
+    text: str,
+    config: dict,
+    profile: str,
+    edit_profile: str,
+    messages: list[dict],
+    prompts: dict[str, str],
+) -> tuple[str, str, bool]:
+    api_key = _openai_api_key()
+    model = (config.get("openai_model") or "").strip()
+    reasoning_effort = (config.get("openai_reasoning_effort") or "low").strip().lower()
+
+    if not api_key or not model or not messages:
+        print("[POST] Post-edit skipped - OpenAI settings incomplete (set OPENAI_API_KEY and LLM settings).", flush=True)
+        return text, "", False
 
     payload = {
         "model": model,
-        "input": input_items,
+        "input": _openai_input_from_messages(messages),
         "text": {
             "format": {
                 "type": "json_schema",
                 "name": "post_edit_result",
                 "strict": True,
-                "schema": {
-                    "type": "object",
-                    "properties": {
-                        "edited_text": {"type": "string"},
-                        "editor_notes": {"type": "string"},
-                    },
-                    "required": ["edited_text", "editor_notes"],
-                    "additionalProperties": False,
-                },
+                "schema": POST_EDIT_RESULT_SCHEMA,
             }
         },
     }
@@ -1764,29 +1816,64 @@ def _post_edit_text(text: str, config: dict, profile: str, edit_profile: str = "
 
         print(f"[POST] Structured output: {_safe_console_text(raw_json)}", flush=True)
         parsed = json.loads(raw_json)
-        edited = (parsed.get("edited_text") or "").strip()
-        editor_notes = (parsed.get("editor_notes") or "").strip()
-        if not edited:
-            print("[POST] Empty edited text returned - keeping original transcript.", flush=True)
-            return text, editor_notes, False
-        if _looks_like_prompt_echo(
-            edited,
-            transcript=text,
-            system_prompt=system_prompt,
-            developer_prompt=rendered_developer_prompt,
-            rendered_user_prompt=rendered_user_prompt,
-        ):
-            print("[POST] Edited text looks like prompt echo - keeping original transcript.", flush=True)
-            return text, editor_notes, False
-
-        print(f"[POST] Edited text: {_safe_console_text(repr(edited))}", flush=True)
-        if editor_notes:
-            print(f"[POST] Editor notes: {_safe_console_text(repr(editor_notes))}", flush=True)
-        print("[POST] Post-edit complete.", flush=True)
-        return edited, editor_notes, True
+        return _validate_post_edit_result(
+            parsed.get("edited_text") or "",
+            parsed.get("editor_notes") or "",
+            text,
+            prompts,
+        )
     except Exception as exc:
         print(f"[POST] Post-edit failed: {_safe_console_text(exc)}", flush=True)
         return text, "", False
+
+
+def _post_edit_text_external(
+    text: str,
+    config: dict,
+    profile: str,
+    edit_profile: str,
+    messages: list[dict],
+    prompts: dict[str, str],
+) -> tuple[str, str, bool]:
+    url = (config.get("external_post_edit_url") or DEFAULT_CONFIG["external_post_edit_url"]).strip()
+    model = (config.get("openai_model") or "").strip()
+    if not url or not model or not messages:
+        print("[POST] External post-edit skipped - proxy URL, model, or prompt messages missing.", flush=True)
+        return text, "", False
+
+    payload = {
+        "model": model,
+        "profile": profile,
+        "edit_profile": edit_profile,
+        "transcript": text,
+        "messages": messages,
+        "schema": POST_EDIT_RESULT_SCHEMA,
+    }
+    print(f"[POST] Sending transcript to external post-editor via {url} ({model}, {profile}/{edit_profile}).", flush=True)
+    try:
+        resp = requests.post(url, json=payload, timeout=90)
+        print(f"[POST] External HTTP {resp.status_code}", flush=True)
+        print(f"[POST] External response: {_safe_console_text(resp.text)}", flush=True)
+        resp.raise_for_status()
+        body = resp.json()
+        return _validate_post_edit_result(
+            body.get("edited_text") or body.get("text") or "",
+            body.get("editor_notes") or "",
+            text,
+            prompts,
+        )
+    except Exception as exc:
+        print(f"[POST] External post-edit failed: {_safe_console_text(exc)}", flush=True)
+        return text, "", False
+
+
+def _post_edit_text(text: str, config: dict, profile: str, edit_profile: str = "dev") -> tuple[str, str, bool]:
+    edit_profile = _post_edit_profile_name(edit_profile) or "dev"
+    messages, prompts = _render_post_edit_messages(text, config, edit_profile)
+    provider = (config.get("post_edit_provider") or DEFAULT_CONFIG["post_edit_provider"]).strip().lower()
+    if provider in {"external", "proxy", "local"}:
+        return _post_edit_text_external(text, config, profile, edit_profile, messages, prompts)
+    return _post_edit_text_openai(text, config, profile, edit_profile, messages, prompts)
 
 
 def _post_wav_bytes(wav_bytes: bytes, config: dict) -> tuple[str | None, str | None]:
@@ -4109,6 +4196,26 @@ def open_settings(config: dict, on_save_callback):
     user_prompt_text = _make_scrolled_text(LLM, row=14, height=8)
     user_prompt_text.insert("1.0", config.get("openai_user_prompt_template", DEFAULT_CONFIG["openai_user_prompt_template"]))
 
+    tk.Label(LLM, text="Post-edit provider:").grid(row=15, column=0, sticky="e", **pad)
+    post_edit_provider_var = tk.StringVar(
+        master=win,
+        value=config.get("post_edit_provider", DEFAULT_CONFIG["post_edit_provider"]),
+    )
+    ttk.Combobox(
+        LLM,
+        textvariable=post_edit_provider_var,
+        values=("openai", "external"),
+        width=12,
+        state="readonly",
+    ).grid(row=15, column=1, sticky="w", **pad)
+
+    tk.Label(LLM, text="External URL:").grid(row=16, column=0, sticky="e", **pad)
+    external_post_edit_url_var = tk.StringVar(
+        master=win,
+        value=config.get("external_post_edit_url", DEFAULT_CONFIG["external_post_edit_url"]),
+    )
+    tk.Entry(LLM, textvariable=external_post_edit_url_var, width=62).grid(row=16, column=1, sticky="ew", **pad)
+
     prompt_sections_by_profile = {
         profile: _load_prompt_markdown(config, profile)
         for profile in POST_EDIT_PROFILES
@@ -4653,6 +4760,10 @@ def open_settings(config: dict, on_save_callback):
             new_cfg["duck_audio_level_percent"] = max(0, min(100, int(duck_audio_level_var.get().strip() or DEFAULT_CONFIG["duck_audio_level_percent"])))
         except Exception:
             new_cfg["duck_audio_level_percent"] = DEFAULT_CONFIG["duck_audio_level_percent"]
+        new_cfg["post_edit_provider"] = post_edit_provider_var.get().strip().lower() or DEFAULT_CONFIG["post_edit_provider"]
+        new_cfg["external_post_edit_url"] = (
+            external_post_edit_url_var.get().strip() or DEFAULT_CONFIG["external_post_edit_url"]
+        )
         new_cfg["openai_model"] = openai_model_var.get().strip() or DEFAULT_CONFIG["openai_model"]
         new_cfg["openai_transcription_model"] = (
             openai_transcription_model_var.get().strip() or DEFAULT_CONFIG["openai_transcription_model"]
@@ -4738,6 +4849,10 @@ def run_tray(config_holder: list[dict]):
     global _native_hotkeys
 
     tray_icon: pystray.Icon | None = None
+    helper_status = {
+        "state": "starting",
+        "detail": "",
+    }
 
     def _force_exit_after_delay(delay_s: float = 1.5):
         def _go():
@@ -4806,6 +4921,39 @@ def run_tray(config_holder: list[dict]):
     def _has_last(item) -> bool:
         return bool(_last_result_text[0] or _latest_history_text())
 
+    def _helper_status_text(_item=None) -> str:
+        bridge = _native_hotkeys
+        if bridge is not None and bridge.is_running():
+            return "KB helper OK"
+        if bridge is not None and bridge.last_error:
+            return f"KB helper N/A: {bridge.last_error}"
+        state = helper_status.get("state")
+        detail = helper_status.get("detail", "")
+        if state == "ok":
+            return "KB helper OK"
+        if state == "starting":
+            return "KB helper starting"
+        return f"KB helper N/A: {detail}" if detail else "KB helper N/A"
+
+    def _set_helper_status(state: str, detail: str = ""):
+        helper_status["state"] = state
+        helper_status["detail"] = detail
+        if tray_icon is None:
+            return
+        try:
+            if state == "ok":
+                tray_icon.title = "OverMultiASRSuite (idle)"
+                tray_icon.icon = _make_icon(_ICON_IDLE)
+            elif state == "starting":
+                tray_icon.title = "OverMultiASRSuite (keyboard helper starting)"
+                tray_icon.icon = _make_icon(_ICON_TRANSCODING, badge_text="K")
+            else:
+                tray_icon.title = f"OverMultiASRSuite ({_helper_status_text()})"
+                tray_icon.icon = _make_icon(_ICON_TRANSCODING, badge_text="!")
+            tray_icon.update_menu()
+        except Exception:
+            pass
+
     def on_quit(icon, item):
         global _native_hotkeys
         _shutdown_requested.set()
@@ -4845,6 +4993,7 @@ def run_tray(config_holder: list[dict]):
         pystray.MenuItem("Microphone",        microphone_menu),
         pystray.MenuItem("Settings…",         on_settings),
         pystray.Menu.SEPARATOR,
+        pystray.MenuItem(_helper_status_text, lambda icon, item: None, enabled=False),
         pystray.MenuItem("Quit",              on_quit),
     )
 
@@ -4945,10 +5094,12 @@ def run_tray(config_holder: list[dict]):
             _native_hotkeys.stop()
             _native_hotkeys = None
 
+        _set_helper_status("starting")
         try:
             bridge = NativeHotkeyBridge(hotkey_str, fast_hotkey_str, undo_str)
             bridge.start()
             _native_hotkeys = bridge
+            _set_helper_status("ok")
             print(f"[TRAY] Native hotkey registered: {hotkey_str}", flush=True)
             if fast_hotkey_str:
                 print(f"[TRAY] Native fast hotkey registered: {fast_hotkey_str}", flush=True)
@@ -4968,14 +5119,24 @@ def run_tray(config_holder: list[dict]):
                             _on_hotkey(name, mode, profile)
                         held[name] = is_down
                     time.sleep(0.01)
+                if (
+                    _native_hotkeys is local_bridge
+                    and not local_bridge._stop.is_set()
+                    and not _shutdown_requested.is_set()
+                    and not local_bridge.is_running()
+                ):
+                    detail = local_bridge.last_error or "helper process is not running"
+                    _set_helper_status("na", detail)
 
             threading.Thread(target=_watch_hold, daemon=True).start()
         except Exception as exc:
             _native_hotkeys = None
-            raise RuntimeError(
-                "Native hotkey helper is required but unavailable. "
+            detail = (
+                f"{_safe_console_text(exc)}. "
                 "Run build.bat with the .NET 8 SDK installed, or place HotkeyHelper.exe next to the app."
-            ) from exc
+            )
+            print(f"[TRAY] Native hotkey helper unavailable: {detail}", flush=True)
+            _set_helper_status("na", detail)
 
     _bind_hotkeys()
 

@@ -22,6 +22,8 @@
   "fast_simple_mode": true,
   "fast_mode": "preview",
   "fast_post_edit_mode": false,
+  "post_edit_provider": "openai",
+  "external_post_edit_url": "http://127.0.0.1:8010/external_postedit",
   "openai_model": "gpt-5-mini",
   "openai_reasoning_effort": "low",
   "openai_dev_prompt_markdown_file": "dev_post_edit_prompt.md",

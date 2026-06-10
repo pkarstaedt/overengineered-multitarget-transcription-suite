@@ -4,12 +4,16 @@ The post-editor proxy is a separate middleware component:
 
 ```text
 client -> post-editor-proxy:/transcribe -> upstream ASR:/transcribe -> Ollama cleanup -> client
+client -> post-editor-proxy:/external_postedit -> Ollama post-edit -> client
 ```
 
 It accepts the same multipart `POST /transcribe` request as the ASR servers and
 returns the same primary `text` field. The proxy replaces `text` with the
 cleaned transcript and adds `raw_text`, `editor_notes`, and `post_editor`
 diagnostics for inspection.
+
+It also exposes `POST /external_postedit` for clients that already have a
+transcript and want to send a full post-edit prompt directly to the local LLM.
 
 ## Install
 
@@ -44,6 +48,16 @@ Point the client at:
 
 ```json
 { "server_url": "http://127.0.0.1:8010/transcribe" }
+```
+
+To use the proxy only for client-side post-editing, keep the ASR backend
+configured normally and set:
+
+```json
+{
+  "post_edit_provider": "external",
+  "external_post_edit_url": "http://127.0.0.1:8010/external_postedit"
+}
 ```
 
 ## Prompt
@@ -148,6 +162,22 @@ OLLAMA_CHAT_THINK=false ./chat.sh
 ```bash
 curl http://127.0.0.1:8010/health
 curl http://127.0.0.1:8010/debug/last
+```
+
+Test direct post-editing without audio:
+
+```bash
+curl -s -X POST http://127.0.0.1:8010/external_postedit \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "qwen3:1.7b",
+    "profile": "main",
+    "edit_profile": "dev",
+    "messages": [
+      {"role": "system", "content": "Return JSON with edited_text and editor_notes."},
+      {"role": "user", "content": "Clean this transcript: um please fix the bug in the settings thing"}
+    ]
+  }'
 ```
 
 Each response includes timing diagnostics:

@@ -18,7 +18,7 @@ from typing import Any
 
 import httpx
 import uvicorn
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Body, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 
 
@@ -134,6 +134,127 @@ def _json_from_ollama_response(payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(content, str):
         raise ValueError("Ollama response did not contain string content")
     return json.loads(content)
+
+
+def _message_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                text = item.get("text")
+                if text:
+                    parts.append(str(text))
+            elif item:
+                parts.append(str(item))
+        return "\n".join(parts)
+    if content is None:
+        return ""
+    return str(content)
+
+
+def _messages_from_external_payload(payload: dict[str, Any]) -> list[dict[str, str]]:
+    source = payload.get("messages") or payload.get("input") or []
+    if not isinstance(source, list):
+        raise HTTPException(status_code=400, detail="messages/input must be a list")
+
+    messages: list[dict[str, str]] = []
+    for item in source:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "user").strip().lower()
+        content = _message_text(item.get("content")).strip()
+        if not content:
+            continue
+        # Ollama chat supports system/user/assistant. Treat OpenAI developer
+        # messages as additional system instructions.
+        if role == "developer":
+            role = "system"
+        if role not in {"system", "user", "assistant"}:
+            role = "user"
+        messages.append({"role": role, "content": content})
+    if not messages:
+        raise HTTPException(status_code=400, detail="no non-empty messages provided")
+    return messages
+
+
+def _optional_bool(value: Any) -> bool | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    return bool(value)
+
+
+async def _call_ollama_structured(
+    *,
+    messages: list[dict[str, str]],
+    model: str,
+    schema: dict[str, Any] | None = None,
+    think: bool | None = None,
+    num_ctx: int | None = None,
+    temperature: float | None = None,
+    keep_alive: str | None = None,
+) -> tuple[str, str, dict[str, Any]]:
+    body = {
+        "model": model,
+        "stream": False,
+        "think": args.think if think is None else think,
+        "format": schema or EDIT_SCHEMA,
+        "keep_alive": keep_alive or args.keep_alive,
+        "options": {
+            "temperature": args.temperature if temperature is None else float(temperature),
+            "num_ctx": args.num_ctx if num_ctx is None else int(num_ctx),
+        },
+        "messages": messages,
+    }
+
+    started = time.time()
+    try:
+        async with httpx.AsyncClient(timeout=args.ollama_timeout) as client:
+            response = await client.post(f"{args.ollama_url.rstrip('/')}/api/chat", json=body)
+    except httpx.HTTPError as exc:
+        return "", "", {"status": "failed", "error": f"ollama_unavailable: {exc}"}
+
+    elapsed_ms = round((time.time() - started) * 1000, 3)
+    if response.status_code >= 400:
+        return "", "", {
+            "status": "failed",
+            "error": f"ollama_failed_http_{response.status_code}",
+            "detail": response.text[:1000],
+            "elapsed_ms": elapsed_ms,
+        }
+
+    try:
+        parsed = _json_from_ollama_response(response.json())
+    except (ValueError, TypeError, json.JSONDecodeError) as exc:
+        return "", "", {
+            "status": "failed",
+            "error": f"invalid_ollama_json: {exc}",
+            "elapsed_ms": elapsed_ms,
+        }
+
+    edited_text = str(parsed.get("edited_text") or "").strip()
+    editor_notes = str(parsed.get("editor_notes") or "").strip()
+    if not edited_text:
+        return "", editor_notes, {
+            "status": "failed",
+            "error": "empty_edited_text",
+            "elapsed_ms": elapsed_ms,
+        }
+
+    return edited_text, editor_notes, {
+        "status": "completed",
+        "model": model,
+        "elapsed_ms": elapsed_ms,
+    }
 
 
 def _log_result(
@@ -292,6 +413,53 @@ async def transcribe(
         "response": response,
     }
     _log_result(raw_text, edited_text, editor_notes, response["post_editor"])
+    return JSONResponse(response)
+
+
+@app.post("/external_postedit")
+async def external_postedit(payload: dict[str, Any] = Body(...)):
+    """Run a caller-supplied post-edit prompt through the local Ollama backend."""
+    global last_result
+
+    total_started = time.time()
+    messages = _messages_from_external_payload(payload)
+    model = str(payload.get("model") or args.model).strip()
+    if not model:
+        raise HTTPException(status_code=400, detail="model is required")
+
+    schema = payload.get("schema") if isinstance(payload.get("schema"), dict) else EDIT_SCHEMA
+    options = payload.get("options") if isinstance(payload.get("options"), dict) else {}
+    edited_text, editor_notes, edit_meta = await _call_ollama_structured(
+        messages=messages,
+        model=model,
+        schema=schema,
+        think=_optional_bool(payload.get("think")),
+        num_ctx=options.get("num_ctx"),
+        temperature=options.get("temperature"),
+        keep_alive=payload.get("keep_alive"),
+    )
+
+    response = {
+        "edited_text": edited_text,
+        "text": edited_text,
+        "editor_notes": editor_notes,
+        "post_editor": {
+            **edit_meta,
+            "profile": payload.get("profile"),
+            "edit_profile": payload.get("edit_profile"),
+            "total_ms": round((time.time() - total_started) * 1000, 3),
+        },
+    }
+    last_result = {
+        "at": time.time(),
+        "external_postedit": True,
+        "profile": payload.get("profile"),
+        "edit_profile": payload.get("edit_profile"),
+        "response": response,
+    }
+
+    if edit_meta.get("status") != "completed":
+        raise HTTPException(status_code=502, detail=response)
     return JSONResponse(response)
 
 
