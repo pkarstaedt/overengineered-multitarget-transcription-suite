@@ -420,7 +420,7 @@ internal static class Program
                         Emit(new { type = "hotkey", name = hotkey.Name, @event = "up" });
                     }
 
-                    if (isDown && hotkey.UsesKey(vk) && (matched || wasActive))
+                    if (hotkey.UsesKey(vk) && (matched || wasActive))
                     {
                         suppress = true;
                     }

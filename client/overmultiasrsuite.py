@@ -1275,6 +1275,127 @@ def _device_sample_rate(device) -> int | None:
         return None
 
 
+def _device_host_api(device) -> str:
+    try:
+        info = sd.query_devices(device)
+        return sd.query_hostapis()[info["hostapi"]]["name"]
+    except Exception:
+        return ""
+
+
+def _device_name(device) -> str:
+    try:
+        return str(sd.query_devices(device)["name"])
+    except Exception:
+        return ""
+
+
+def _device_label(device) -> str:
+    if device is None:
+        return "system default"
+    name = _device_name(device) or "unknown"
+    api = _device_host_api(device) or "unknown API"
+    return f"{device}: {name} [{api}]"
+
+
+def _candidate_sample_rates(device, target_sr: int) -> list[int]:
+    candidates = [
+        _device_sample_rate(device),
+        target_sr,
+        48000,
+        44100,
+        32000,
+        16000,
+    ]
+    result: list[int] = []
+    for rate in candidates:
+        try:
+            rate = int(rate)
+        except Exception:
+            continue
+        if rate > 0 and rate not in result:
+            result.append(rate)
+    return result or [int(target_sr)]
+
+
+_recording_probe_lock = threading.Lock()
+_recording_probe_cache: dict[tuple[str, int], dict] = {}
+
+
+def _recording_probe_key(device, target_sr: int) -> tuple[str, int]:
+    return (str(device) if device is not None else "default", int(target_sr))
+
+
+def _probe_recording_backend(config: dict, *, force: bool = False) -> dict:
+    target_sr = int(config.get("sample_rate", 16000))
+    device = config.get("microphone_index")
+    key = _recording_probe_key(device, target_sr)
+    with _recording_probe_lock:
+        cached = _recording_probe_cache.get(key)
+        if cached and not force:
+            return cached
+
+    last_error: Exception | None = None
+    print(f"[REC] Probing input device {_device_label(device)}.", flush=True)
+    for method in ("stream", "rec"):
+        for candidate_sr in _candidate_sample_rates(device, target_sr):
+            try:
+                if method == "rec":
+                    probe = sd.rec(
+                        max(1, int(0.25 * candidate_sr)),
+                        samplerate=candidate_sr,
+                        channels=1,
+                        dtype="int16",
+                        device=device,
+                    )
+                    sd.wait()
+                    _ = probe.shape
+                else:
+                    with sd.InputStream(
+                        device=device,
+                        samplerate=candidate_sr,
+                        channels=1,
+                        dtype="int16",
+                        blocksize=max(512, int(0.10 * candidate_sr)),
+                    ) as stream:
+                        stream.read(max(512, int(0.10 * candidate_sr)))
+                result = {
+                    "ok": True,
+                    "device": device,
+                    "target_sr": target_sr,
+                    "native_sr": int(candidate_sr),
+                    "method": method,
+                }
+                with _recording_probe_lock:
+                    _recording_probe_cache[key] = result
+                print(f"[REC] Probe OK: {_device_label(device)} via {method} at {candidate_sr} Hz.", flush=True)
+                return result
+            except Exception as exc:
+                last_error = exc
+                print(f"[REC] Probe failed via {method} at {candidate_sr} Hz: {exc}", flush=True)
+                try:
+                    sd.stop()
+                except Exception:
+                    pass
+
+    result = {
+        "ok": False,
+        "device": device,
+        "target_sr": target_sr,
+        "native_sr": target_sr,
+        "method": "rec",
+        "error": str(last_error or "Could not open selected input device."),
+    }
+    with _recording_probe_lock:
+        _recording_probe_cache[key] = result
+    return result
+
+
+def _warm_recording_probe(config: dict, *, force: bool = False):
+    snapshot = dict(config)
+    threading.Thread(target=lambda: _probe_recording_backend(snapshot, force=force), daemon=True).start()
+
+
 def _resample_audio(audio: np.ndarray, from_sr: int, to_sr: int) -> np.ndarray:
     """Resample int16 audio array (shape N×1 or N,) via linear interpolation."""
     mono = np.asarray(audio, dtype=np.int16).reshape(-1, 1)
@@ -1335,16 +1456,30 @@ def _record_with_vad(
     min_speech  = config.get("vad_min_speech_s", _VAD_MIN_SPEECH_S)
     max_chunk_s = config.get("vad_max_chunk_s",  30.0)
 
-    # Use the device's native sample rate for recording, then resample.
-    # This avoids PortAudio -9997 on WASAPI devices locked to e.g. 48000 Hz.
-    native_sr = _device_sample_rate(device) or target_sr
+    probe = _probe_recording_backend(config)
+    if not probe.get("ok"):
+        error = probe.get("error") or "Could not open selected input device."
+        print(f"[REC] Input device unavailable: {_device_label(device)}: {error}", flush=True)
+        return None, [], None, post_edit_active, None, int(probe.get("native_sr") or target_sr)
+
+    native_sr = int(probe.get("native_sr") or target_sr)
+    record_method = probe.get("method") or "rec"
+    print(f"[REC] Input device: {_device_label(device)}", flush=True)
+    print(f"[REC] Using cached input mode: {record_method} at {native_sr} Hz", flush=True)
     if native_sr != target_sr:
         print(f"[REC] Device native {native_sr} Hz -> resampling to {target_sr} Hz", flush=True)
 
-    SIL_SAMPLES      = max(1, int(sil_secs * native_sr))
-    SPEECH_SAMPLES   = max(1, int(min_speech * native_sr))
-    MIN_SAMPLES      = max(1, int(0.3 * native_sr))
-    HANGOVER_SAMPLES = max(1, int(config.get("vad_hangover_s", 0.3) * native_sr))
+    SIL_SAMPLES = SPEECH_SAMPLES = MIN_SAMPLES = HANGOVER_SAMPLES = 1
+
+    def _configure_rate(rate: int):
+        nonlocal native_sr, SIL_SAMPLES, SPEECH_SAMPLES, MIN_SAMPLES, HANGOVER_SAMPLES
+        native_sr = int(rate)
+        SIL_SAMPLES      = max(1, int(sil_secs * native_sr))
+        SPEECH_SAMPLES   = max(1, int(min_speech * native_sr))
+        MIN_SAMPLES      = max(1, int(0.3 * native_sr))
+        HANGOVER_SAMPLES = max(1, int(config.get("vad_hangover_s", 0.3) * native_sr))
+
+    _configure_rate(native_sr)
 
     pending:    list[tuple[list, threading.Event]] = []
     all_data:   list[np.ndarray] = []
@@ -1401,6 +1536,27 @@ def _record_with_vad(
         except Exception:
             pass
 
+    def _handle_post_edit_toggle():
+        nonlocal post_edit_active, toggle_y_down
+        y_down = False
+        if toggle_enabled:
+            try:
+                y_down = keyboard.is_pressed(toggle_key)
+            except Exception:
+                y_down = False
+            if y_down and not toggle_y_down:
+                post_edit_active = _next_post_edit_profile(post_edit_active)
+                state_label = post_edit_active.upper() if post_edit_active else "OFF"
+                print(
+                    f"[POST] Session post-edit profile set to {state_label} via {toggle_key.upper()}.",
+                    flush=True,
+                )
+                try:
+                    on_post_edit_toggle(post_edit_active)
+                except Exception:
+                    pass
+        toggle_y_down = y_down
+
     try:
         if toggle_enabled and insert_mode == "paste_right_click":
             try:
@@ -1411,39 +1567,67 @@ def _record_with_vad(
                 print(f"[POST] Failed to suppress toggle key {toggle_key.upper()}: {_safe_console_text(exc)}", flush=True)
 
         max_record_s = max(1.0, float(max_chunk_s))
-        max_record_samples = max(1, int(max_record_s * native_sr))
-        print(
-            f"[REC] Recording (single sd.rec buffer at {native_sr} Hz, max {max_record_s:.1f}s)...",
-            flush=True,
-        )
-        started_at = time.time()
-        recording = sd.rec(
-            max_record_samples,
-            samplerate=native_sr,
-            channels=1,
-            dtype="int16",
-            device=device,
-        )
+        recording = None
+        max_record_samples = 0
+        _configure_rate(native_sr)
+        if record_method == "rec":
+            max_record_samples = max(1, int(max_record_s * native_sr))
+            print(
+                f"[REC] Recording (single sd.rec buffer at {native_sr} Hz, max {max_record_s:.1f}s)...",
+                flush=True,
+            )
+            try:
+                recording = sd.rec(
+                    max_record_samples,
+                    samplerate=native_sr,
+                    channels=1,
+                    dtype="int16",
+                    device=device,
+                )
+            except Exception as exc:
+                with _recording_probe_lock:
+                    _recording_probe_cache.pop(_recording_probe_key(device, target_sr), None)
+                raise
+        else:
+            max_record_samples = max(1, int(max_record_s * native_sr))
+            print("[REC] Recording (InputStream on cached selected device mode)...", flush=True)
+            try:
+                with sd.InputStream(
+                    device=device,
+                    samplerate=native_sr,
+                    channels=1,
+                    dtype="int16",
+                    blocksize=max(512, int(0.10 * native_sr)),
+                ) as stream:
+                    print(f"[REC] Recording (InputStream at {native_sr} Hz, max {max_record_s:.1f}s)...", flush=True)
+                    started_at = time.time()
+                    while (
+                        (_native_hotkeys.is_pressed(hotkey_name) if _native_hotkeys else keyboard.is_pressed(config["hotkey"]))
+                        and time.time() - started_at < max_record_s
+                    ):
+                        _handle_post_edit_toggle()
+                        data, _ = stream.read(max(512, int(0.10 * native_sr)))
+                        blk = data.copy()
+                        all_data.append(blk)
+                        current.append(blk)
+                        rms = float(np.sqrt(np.mean(blk.astype(np.float64) ** 2)))
+                        if rms < rms_min:
+                            rms_min = rms
+                        if rms > rms_max:
+                            rms_max = rms
+                        chunk_peak = max(chunk_peak, rms)
+                        spk += len(blk)
+                recording = np.concatenate(all_data) if all_data else np.empty((0, 1), dtype=np.int16)
+                max_record_samples = len(recording)
+            except Exception:
+                with _recording_probe_lock:
+                    _recording_probe_cache.pop(_recording_probe_key(device, target_sr), None)
+                raise
+
         reached_limit = False
-        while (_native_hotkeys.is_pressed(hotkey_name) if _native_hotkeys else keyboard.is_pressed(config["hotkey"])):
-            y_down = False
-            if toggle_enabled:
-                try:
-                    y_down = keyboard.is_pressed(toggle_key)
-                except Exception:
-                    y_down = False
-                if y_down and not toggle_y_down:
-                    post_edit_active = _next_post_edit_profile(post_edit_active)
-                    state_label = post_edit_active.upper() if post_edit_active else "OFF"
-                    print(
-                        f"[POST] Session post-edit profile set to {state_label} via {toggle_key.upper()}.",
-                        flush=True,
-                    )
-                    try:
-                        on_post_edit_toggle(post_edit_active)
-                    except Exception:
-                        pass
-            toggle_y_down = y_down
+        started_at = time.time()
+        while recording is not None and len(all_data) == 0 and (_native_hotkeys.is_pressed(hotkey_name) if _native_hotkeys else keyboard.is_pressed(config["hotkey"])):
+            _handle_post_edit_toggle()
 
             if time.time() - started_at >= max_record_s:
                 reached_limit = True
@@ -1451,12 +1635,13 @@ def _record_with_vad(
             time.sleep(0.02)
 
         elapsed_s = min(max(0.0, time.time() - started_at), max_record_s)
-        if reached_limit:
-            sd.wait()
-        else:
-            sd.stop()
+        if not all_data:
+            if reached_limit:
+                sd.wait()
+            else:
+                sd.stop()
         used_samples = min(max_record_samples, max(0, int(elapsed_s * native_sr)))
-        if used_samples:
+        if used_samples and not all_data:
             raw_capture = recording[:used_samples].copy()
             all_data.append(raw_capture)
             current.append(raw_capture)
@@ -1472,7 +1657,7 @@ def _record_with_vad(
                     rms_max = rms
                 chunk_peak = max(chunk_peak, rms)
                 spk += len(blk)
-        else:
+        elif not all_data:
             print("[REC] No samples captured before hotkey release.", flush=True)
 
         skip_legacy_chunk_recorder = True
@@ -1565,7 +1750,13 @@ def _record_with_vad(
                     current = []
                     _reset_chunk()
     except Exception as exc:
-        print(f"[REC] Stream error: {exc}", flush=True)
+        print(f"[REC] Stream error on {_device_label(device)} at {native_sr} Hz: {exc}", flush=True)
+        if "-9999" in str(exc) or "WDM-KS" in str(exc):
+            print(
+                "[REC] The selected Windows audio endpoint failed at open time. "
+                "Pick a different explicit microphone index in Settings or run --list-mics to compare host APIs.",
+                flush=True,
+            )
         return None, [], None, post_edit_active, None, native_sr
     finally:
         for hook in (toggle_press_hook, toggle_release_hook):
@@ -3211,10 +3402,7 @@ def run_session(
                         history_entry["raw_wav"] = str(_save_failed_wav(raw_full_audio, native_sr, "failed_native"))
                 _add_to_history(history_entry)
                 _hide_preview_overlay()
-                print(f"[TYPE] Error — typing message for 5 s: {error!r}", flush=True)
-                type_text(error)
-                time.sleep(5)
-                delete_chars(len(error))
+                print(f"[TYPE] Error saved to history; nothing typed into target: {error!r}", flush=True)
             else:
                 _hide_preview_overlay()
                 print("[TYPE] Empty result — nothing typed.", flush=True)
@@ -3229,11 +3417,10 @@ def run_session(
         except Exception:
             pass
     fancy = not simple_cfg
-    inline_status = (
-        insert_mode == "type"
-        or profile == "fast"
-        or (profile == "main" and simple_cfg)
-    )
+    # Only type transient status characters into targets that are already in
+    # slow typed-input mode. Paste/right-click targets should never receive
+    # animation/status leftovers if recording fails while the hotkey is held.
+    inline_status = insert_mode == "type"
     overlay_status = False
     overlay_recording = _OVL_FAST_RECORDING if profile == "fast" else _OVL_RECORDING
     overlay_transcribing = _OVL_FAST_TRANSCRIBING if profile == "fast" else _OVL_TRANSCRIBING
@@ -3393,10 +3580,7 @@ def run_session(
                     if raw_full_audio is not None:
                         history_entry["raw_wav"] = str(_save_failed_wav(raw_full_audio, native_sr, "failed_native"))
                 _add_to_history(history_entry)
-                print(f"[TYPE] Error — typing message for 5 s: {error!r}", flush=True)
-                type_text(error)
-                time.sleep(5)
-                delete_chars(len(error))
+                print(f"[TYPE] Error saved to history; nothing typed into target: {error!r}", flush=True)
             else:
                 print("[TYPE] Empty result — nothing typed.", flush=True)
 
@@ -3549,10 +3733,7 @@ def run_session(
                     if raw_full_audio is not None:
                         history_entry["raw_wav"] = str(_save_failed_wav(raw_full_audio, native_sr, "failed_native"))
                 _add_to_history(history_entry)
-                print(f"[TYPE] Error — typing message for 5 s: {error!r}", flush=True)
-                type_text(error)
-                time.sleep(5)
-                delete_chars(len(error))
+                print(f"[TYPE] Error saved to history; nothing typed into target: {error!r}", flush=True)
             else:
                 print("[TYPE] Empty result — nothing typed.", flush=True)
 
@@ -3827,9 +4008,6 @@ def open_settings(config: dict, on_save_callback):
     ).grid(row=0, column=0, sticky="w", padx=4, pady=(4, 10))
 
     devices = list_input_devices()
-    wasapi_devices = [(i, n, api) for i, n, api in devices if api == "Windows WASAPI"]
-    wasapi_devices = [(i, n, api) for i, n, api in devices if api == "Windows WASAPI"]
-    wasapi_devices = [(i, n, api) for i, n, api in devices if api == "Windows WASAPI"]
 
     def _dev_label(i, n, api):
         return f"{i}: {n}  [{api}{' (!)' if api not in _PREFERRED_APIS else ''}]"
@@ -4088,9 +4266,29 @@ def open_settings(config: dict, on_save_callback):
         wraplength=520,
     ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
 
-    tk.Label(LLM, text="API key env:").grid(row=1, column=0, sticky="e", **pad)
+    tk.Label(LLM, text="Post-edit provider:").grid(row=1, column=0, sticky="e", **pad)
+    post_edit_provider_var = tk.StringVar(
+        master=win,
+        value=config.get("post_edit_provider", DEFAULT_CONFIG["post_edit_provider"]),
+    )
+    ttk.Combobox(
+        LLM,
+        textvariable=post_edit_provider_var,
+        values=("openai", "external"),
+        width=12,
+        state="readonly",
+    ).grid(row=1, column=1, sticky="w", **pad)
+
+    tk.Label(LLM, text="External URL:").grid(row=2, column=0, sticky="e", **pad)
+    external_post_edit_url_var = tk.StringVar(
+        master=win,
+        value=config.get("external_post_edit_url", DEFAULT_CONFIG["external_post_edit_url"]),
+    )
+    tk.Entry(LLM, textvariable=external_post_edit_url_var, width=62).grid(row=2, column=1, sticky="ew", **pad)
+
+    tk.Label(LLM, text="API key env:").grid(row=3, column=0, sticky="e", **pad)
     api_key_status = "set" if _openai_api_key() else "not set"
-    tk.Label(LLM, text=f"OPENAI_API_KEY ({api_key_status})", anchor="w").grid(row=1, column=1, sticky="w", **pad)
+    tk.Label(LLM, text=f"OPENAI_API_KEY ({api_key_status})", anchor="w").grid(row=3, column=1, sticky="w", **pad)
 
     def _make_scrolled_text(parent, row: int, height: int):
         frame = tk.Frame(parent)
@@ -4104,11 +4302,11 @@ def open_settings(config: dict, on_save_callback):
         yscroll.grid(row=0, column=1, sticky="ns")
         return text_widget
 
-    tk.Label(LLM, text="Model:").grid(row=2, column=0, sticky="e", **pad)
+    tk.Label(LLM, text="Model:").grid(row=4, column=0, sticky="e", **pad)
     openai_model_var = tk.StringVar(master=win, value=config.get("openai_model", DEFAULT_CONFIG["openai_model"]))
-    tk.Entry(LLM, textvariable=openai_model_var, width=28).grid(row=2, column=1, sticky="w", **pad)
+    tk.Entry(LLM, textvariable=openai_model_var, width=28).grid(row=4, column=1, sticky="w", **pad)
 
-    tk.Label(LLM, text="Reasoning effort:").grid(row=3, column=0, sticky="e", **pad)
+    tk.Label(LLM, text="Reasoning effort:").grid(row=5, column=0, sticky="e", **pad)
     reasoning_var = tk.StringVar(master=win, value=config.get("openai_reasoning_effort", DEFAULT_CONFIG["openai_reasoning_effort"]))
     ttk.Combobox(
         LLM,
@@ -4116,22 +4314,22 @@ def open_settings(config: dict, on_save_callback):
         values=("minimal", "low", "medium", "high"),
         width=12,
         state="readonly",
-    ).grid(row=3, column=1, sticky="w", **pad)
+    ).grid(row=5, column=1, sticky="w", **pad)
 
-    tk.Label(LLM, text="Transcribe model:").grid(row=4, column=0, sticky="e", **pad)
+    tk.Label(LLM, text="Transcribe model:").grid(row=6, column=0, sticky="e", **pad)
     openai_transcription_model_var = tk.StringVar(
         master=win,
         value=config.get("openai_transcription_model", DEFAULT_CONFIG["openai_transcription_model"]),
     )
-    tk.Entry(LLM, textvariable=openai_transcription_model_var, width=28).grid(row=4, column=1, sticky="w", **pad)
+    tk.Entry(LLM, textvariable=openai_transcription_model_var, width=28).grid(row=6, column=1, sticky="w", **pad)
 
-    tk.Label(LLM, text="Transcribe prompt:").grid(row=5, column=0, sticky="ne", **pad)
-    openai_transcription_prompt_text = _make_scrolled_text(LLM, row=5, height=4)
+    tk.Label(LLM, text="Transcribe prompt:").grid(row=7, column=0, sticky="ne", **pad)
+    openai_transcription_prompt_text = _make_scrolled_text(LLM, row=7, height=4)
     openai_transcription_prompt_text.insert(
         "1.0",
         config.get("openai_transcription_prompt", DEFAULT_CONFIG["openai_transcription_prompt"]),
     )
-    tk.Label(LLM, text="Transcribe prompt file:").grid(row=6, column=0, sticky="ne", **pad)
+    tk.Label(LLM, text="Transcribe prompt file:").grid(row=8, column=0, sticky="ne", **pad)
     tk.Label(
         LLM,
         text=str(_transcription_prompt_markdown_path(config)),
@@ -4139,30 +4337,30 @@ def open_settings(config: dict, on_save_callback):
         justify="left",
         wraplength=520,
         fg="grey",
-    ).grid(row=6, column=1, sticky="w", **pad)
+    ).grid(row=8, column=1, sticky="w", **pad)
 
-    tk.Label(LLM, text="Notes base secs:").grid(row=7, column=0, sticky="e", **pad)
+    tk.Label(LLM, text="Notes base secs:").grid(row=9, column=0, sticky="e", **pad)
     editor_notes_overlay_var = tk.StringVar(
         master=win,
         value=str(config.get("editor_notes_overlay_seconds", DEFAULT_CONFIG["editor_notes_overlay_seconds"])),
     )
-    tk.Entry(LLM, textvariable=editor_notes_overlay_var, width=8).grid(row=7, column=1, sticky="w", **pad)
+    tk.Entry(LLM, textvariable=editor_notes_overlay_var, width=8).grid(row=9, column=1, sticky="w", **pad)
 
-    tk.Label(LLM, text="Chars / extra sec:").grid(row=8, column=0, sticky="e", **pad)
+    tk.Label(LLM, text="Chars / extra sec:").grid(row=10, column=0, sticky="e", **pad)
     editor_notes_scale_var = tk.StringVar(
         master=win,
         value=str(config.get("editor_notes_chars_per_extra_second", DEFAULT_CONFIG["editor_notes_chars_per_extra_second"])),
     )
-    tk.Entry(LLM, textvariable=editor_notes_scale_var, width=8).grid(row=8, column=1, sticky="w", **pad)
+    tk.Entry(LLM, textvariable=editor_notes_scale_var, width=8).grid(row=10, column=1, sticky="w", **pad)
 
-    tk.Label(LLM, text="Toggle key:").grid(row=9, column=0, sticky="e", **pad)
+    tk.Label(LLM, text="Toggle key:").grid(row=11, column=0, sticky="e", **pad)
     post_edit_toggle_key_var = tk.StringVar(
         master=win,
         value=config.get("post_edit_toggle_key", DEFAULT_CONFIG["post_edit_toggle_key"]),
     )
-    tk.Entry(LLM, textvariable=post_edit_toggle_key_var, width=8).grid(row=9, column=1, sticky="w", **pad)
+    tk.Entry(LLM, textvariable=post_edit_toggle_key_var, width=8).grid(row=11, column=1, sticky="w", **pad)
 
-    tk.Label(LLM, text="Post-edit profile:").grid(row=10, column=0, sticky="e", **pad)
+    tk.Label(LLM, text="Post-edit profile:").grid(row=12, column=0, sticky="e", **pad)
     prompt_profile_var = tk.StringVar(master=win, value=POST_EDIT_PROFILES[0])
     prompt_profile_combo = ttk.Combobox(
         LLM,
@@ -4171,9 +4369,9 @@ def open_settings(config: dict, on_save_callback):
         width=12,
         state="readonly",
     )
-    prompt_profile_combo.grid(row=10, column=1, sticky="w", **pad)
+    prompt_profile_combo.grid(row=12, column=1, sticky="w", **pad)
 
-    tk.Label(LLM, text="Profile prompt file:").grid(row=11, column=0, sticky="ne", **pad)
+    tk.Label(LLM, text="Profile prompt file:").grid(row=13, column=0, sticky="ne", **pad)
     prompt_profile_path_var = tk.StringVar(master=win, value=str(_prompt_markdown_path(config, POST_EDIT_PROFILES[0])))
     tk.Label(
         LLM,
@@ -4182,39 +4380,19 @@ def open_settings(config: dict, on_save_callback):
         justify="left",
         wraplength=520,
         fg="grey",
-    ).grid(row=11, column=1, sticky="w", **pad)
+    ).grid(row=13, column=1, sticky="w", **pad)
 
-    tk.Label(LLM, text="System prompt:").grid(row=12, column=0, sticky="ne", **pad)
-    system_prompt_text = _make_scrolled_text(LLM, row=12, height=4)
+    tk.Label(LLM, text="System prompt:").grid(row=14, column=0, sticky="ne", **pad)
+    system_prompt_text = _make_scrolled_text(LLM, row=14, height=4)
     system_prompt_text.insert("1.0", config.get("openai_system_prompt", DEFAULT_CONFIG["openai_system_prompt"]))
 
-    tk.Label(LLM, text="Developer prompt:").grid(row=13, column=0, sticky="ne", **pad)
-    developer_prompt_text = _make_scrolled_text(LLM, row=13, height=6)
+    tk.Label(LLM, text="Developer prompt:").grid(row=15, column=0, sticky="ne", **pad)
+    developer_prompt_text = _make_scrolled_text(LLM, row=15, height=6)
     developer_prompt_text.insert("1.0", config.get("openai_developer_prompt", DEFAULT_CONFIG["openai_developer_prompt"]))
 
-    tk.Label(LLM, text="User prompt template:").grid(row=14, column=0, sticky="ne", **pad)
-    user_prompt_text = _make_scrolled_text(LLM, row=14, height=8)
+    tk.Label(LLM, text="User prompt template:").grid(row=16, column=0, sticky="ne", **pad)
+    user_prompt_text = _make_scrolled_text(LLM, row=16, height=8)
     user_prompt_text.insert("1.0", config.get("openai_user_prompt_template", DEFAULT_CONFIG["openai_user_prompt_template"]))
-
-    tk.Label(LLM, text="Post-edit provider:").grid(row=15, column=0, sticky="e", **pad)
-    post_edit_provider_var = tk.StringVar(
-        master=win,
-        value=config.get("post_edit_provider", DEFAULT_CONFIG["post_edit_provider"]),
-    )
-    ttk.Combobox(
-        LLM,
-        textvariable=post_edit_provider_var,
-        values=("openai", "external"),
-        width=12,
-        state="readonly",
-    ).grid(row=15, column=1, sticky="w", **pad)
-
-    tk.Label(LLM, text="External URL:").grid(row=16, column=0, sticky="e", **pad)
-    external_post_edit_url_var = tk.StringVar(
-        master=win,
-        value=config.get("external_post_edit_url", DEFAULT_CONFIG["external_post_edit_url"]),
-    )
-    tk.Entry(LLM, textvariable=external_post_edit_url_var, width=62).grid(row=16, column=1, sticky="ew", **pad)
 
     prompt_sections_by_profile = {
         profile: _load_prompt_markdown(config, profile)
@@ -4286,6 +4464,16 @@ def open_settings(config: dict, on_save_callback):
     btn_row   = tk.Frame(MT)
     btn_row.grid(row=2, column=0, columnspan=2, sticky="w", pady=(0, 0))
 
+    mic_test_status_var = tk.StringVar(master=win, value="")
+    tk.Label(
+        MT,
+        textvariable=mic_test_status_var,
+        fg="#6b7280",
+        anchor="w",
+        justify="left",
+        wraplength=520,
+    ).grid(row=3, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+
     _mon_active = [False]
     _test_audio = [None]
     _test_audio_sr = [16000]
@@ -4296,6 +4484,9 @@ def open_settings(config: dict, on_save_callback):
 
     def _selected_device_sample_rate() -> int:
         return _device_sample_rate(_selected_device()) or int(config.get("sample_rate", 16000))
+
+    def _selected_sample_rate_candidates() -> list[int]:
+        return _candidate_sample_rates(_selected_device(), int(config.get("sample_rate", 16000)))
 
     def _update_meter(pct, db, rms):
         w     = meter.winfo_width() or 300
@@ -4311,20 +4502,31 @@ def open_settings(config: dict, on_save_callback):
             peak_label.config(text=f"{rms:.0f}")
 
     def _monitor_loop():
+        last_error = None
         try:
-            native_sr = _selected_device_sample_rate()
-            print(f"[MIC TEST] Monitor using {native_sr} Hz.", flush=True)
-            with sd.InputStream(device=_selected_device(), samplerate=native_sr,
-                                channels=1, dtype="int16", blocksize=512) as stream:
-                while _mon_active[0]:
-                    data, _ = stream.read(512)
-                    rms = float(np.sqrt(np.mean(data.astype(np.float64) ** 2)))
-                    db  = 20 * np.log10(max(rms, 1.0) / 32768.0)
-                    pct = max(0.0, min(100.0, (db + 60) / 60 * 100))
-                    win.after(0, lambda p=pct, d=db, r=rms: _update_meter(p, d, r))
+            device = _selected_device()
+            for native_sr in _selected_sample_rate_candidates():
+                try:
+                    status = f"Monitoring {_device_label(device)} at {native_sr} Hz"
+                    win.after(0, lambda s=status: mic_test_status_var.set(s))
+                    print(f"[MIC TEST] {status}.", flush=True)
+                    with sd.InputStream(device=device, samplerate=native_sr,
+                                        channels=1, dtype="int16", blocksize=512) as stream:
+                        while _mon_active[0]:
+                            data, _ = stream.read(512)
+                            rms = float(np.sqrt(np.mean(data.astype(np.float64) ** 2)))
+                            db  = 20 * np.log10(max(rms, 1.0) / 32768.0)
+                            pct = max(0.0, min(100.0, (db + 60) / 60 * 100))
+                            win.after(0, lambda p=pct, d=db, r=rms: _update_meter(p, d, r))
+                    return
+                except Exception as exc:
+                    last_error = exc
+                    print(f"[MIC TEST] monitor failed at {native_sr} Hz: {exc}", flush=True)
+            raise last_error or RuntimeError("No sample rate opened.")
         except Exception as exc:
-            msg = "WDM-KS error - pick MME/WASAPI" if "-9999" in str(exc) else "open failed"
-            win.after(0, lambda m=msg: db_label.config(text=m))
+            msg = f"Open failed: {exc}"
+            win.after(0, lambda: db_label.config(text="ERR"))
+            win.after(0, lambda m=msg: mic_test_status_var.set(m))
             win.after(0, lambda: mon_btn.config(text="Monitor"))
             _mon_active[0] = False
             print(f"[MIC TEST] {exc}", flush=True)
@@ -4350,28 +4552,46 @@ def open_settings(config: dict, on_save_callback):
         play_btn.config(state="disabled")
         def _do():
             _test_audio[0] = None
+            last_error = None
             try:
-                native_sr = _selected_device_sample_rate()
-                _test_audio_sr[0] = native_sr
-                print(f"[MIC TEST] Recording test using {native_sr} Hz.", flush=True)
-                for remaining in range(3, 0, -1):
-                    win.after(0, lambda n=remaining: rec_btn.config(
-                        text=f"Recording... {n}s", state="disabled"))
-                    chunk = sd.rec(native_sr, samplerate=native_sr, channels=1,
-                                   dtype="int16", device=_selected_device())
-                    sd.wait()
-                    rms = float(np.sqrt(np.mean(chunk.astype(np.float64) ** 2)))
-                    db  = 20 * np.log10(max(rms, 1.0) / 32768.0)
-                    pct = max(0.0, min(100.0, (db + 60) / 60 * 100))
-                    win.after(0, lambda p=pct, d=db, r=rms: _update_meter(p, d, r))
-                    _test_audio[0] = chunk if _test_audio[0] is None else np.concatenate([_test_audio[0], chunk])
+                device = _selected_device()
+                for native_sr in _selected_sample_rate_candidates():
+                    try:
+                        _test_audio_sr[0] = native_sr
+                        status = f"Recording test using {_device_label(device)} at {native_sr} Hz"
+                        win.after(0, lambda s=status: mic_test_status_var.set(s))
+                        print(f"[MIC TEST] {status}.", flush=True)
+                        for remaining in range(3, 0, -1):
+                            win.after(0, lambda n=remaining: rec_btn.config(
+                                text=f"Recording... {n}s", state="disabled"))
+                            chunk = sd.rec(native_sr, samplerate=native_sr, channels=1,
+                                           dtype="int16", device=device)
+                            sd.wait()
+                            rms = float(np.sqrt(np.mean(chunk.astype(np.float64) ** 2)))
+                            db  = 20 * np.log10(max(rms, 1.0) / 32768.0)
+                            pct = max(0.0, min(100.0, (db + 60) / 60 * 100))
+                            win.after(0, lambda p=pct, d=db, r=rms: _update_meter(p, d, r))
+                            _test_audio[0] = chunk if _test_audio[0] is None else np.concatenate([_test_audio[0], chunk])
+                        break
+                    except Exception as exc:
+                        last_error = exc
+                        print(f"[MIC TEST] record failed at {native_sr} Hz: {exc}", flush=True)
+                        try:
+                            sd.stop()
+                        except Exception:
+                            pass
+                if _test_audio[0] is None:
+                    raise last_error or RuntimeError("No sample rate opened.")
             except Exception as exc:
-                hint = " (WDM-KS)" if "-9999" in str(exc) else ""
+                hint = " (WDM-KS)" if "-9999" in str(exc) or "WDM-KS" in str(exc) else ""
+                msg = f"Record failed{hint}: {exc}"
                 print(f"[MIC TEST] record error: {exc}", flush=True)
+                win.after(0, lambda m=msg: mic_test_status_var.set(m))
                 win.after(0, lambda h=hint: rec_btn.config(text=f"Error{h}", state="normal"))
                 return
             win.after(0, lambda: (rec_btn.config(text="Record 3s", state="normal"),
                                   play_btn.config(state="normal")))
+            win.after(0, lambda: mic_test_status_var.set("Recording test complete"))
         threading.Thread(target=_do, daemon=True).start()
 
     def _play_test():
@@ -4790,6 +5010,7 @@ def open_settings(config: dict, on_save_callback):
         new_cfg["openai_user_prompt_template"] = dev_prompt_sections.get("user") or DEFAULT_CONFIG["openai_user_prompt_template"]
         new_cfg["live_mode"]   = new_cfg["main_live_mode"]
         new_cfg["simple_mode"] = new_cfg["main_simple_mode"]
+        _probe_recording_backend(new_cfg, force=True)
         _current_config[0] = new_cfg
         sync_input_classes(new_cfg)
         save_config(new_cfg)
@@ -4884,7 +5105,7 @@ def run_tray(config_holder: list[dict]):
         threading.Thread(target=_open, daemon=True).start()
 
     devices = list_input_devices()
-    wasapi_devices = [(i, n, api) for i, n, api in devices if api == "Windows WASAPI"]
+    preferred_devices = [(i, n, api) for i, n, api in devices if api in _PREFERRED_APIS]
 
     def _dev_label(i, n, api):
         return f"{i}: {n}  [{api}{'  (!) WDM-KS' if api not in _PREFERRED_APIS else ''}]"
@@ -4894,6 +5115,7 @@ def run_tray(config_holder: list[dict]):
         cfg["microphone_index"] = index
         config_holder[0] = cfg
         save_config(cfg)
+        _probe_recording_backend(cfg, force=True)
 
     def _make_mic_handler(index: int | None):
         def _handler(icon, item):
@@ -4983,7 +5205,7 @@ def run_tray(config_holder: list[dict]):
                 checked=_mic_checked(i),
                 radio=True,
             )
-            for i, n, api in wasapi_devices
+            for i, n, api in preferred_devices
         ],
     )
 
@@ -5212,6 +5434,7 @@ def main():
             print(f"  [{idx:2}] {name}  [{api}]{warn}")
         return
 
+    _probe_recording_backend(cfg, force=True)
     run_tray(config_holder)
 
 
