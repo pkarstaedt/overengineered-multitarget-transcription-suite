@@ -90,7 +90,8 @@ If focus moves away from a text input (e.g. a dialog pops up) while recording, t
 
 ## Transcription server
 
-The client posts audio to any HTTP endpoint that accepts `multipart/form-data`:
+The default `http` backend posts audio to any HTTP endpoint that accepts
+`multipart/form-data`:
 
 ```
 POST /transcribe
@@ -131,6 +132,49 @@ In practice, the minimum viable successful response is:
 If the server returns a non-2xx status, invalid JSON, or a payload without usable text, the client treats the request as failed and shows/logs an error instead of inserting text.
 
 The client is tested against [faster-whisper-server](https://github.com/fedirz/faster-whisper-server) and the local [Parakeet server options](#local-parakeet-server-options) included in this repo. Any server with the same API shape works.
+
+The dedicated `whispercpp` backend talks to a stock whisper.cpp server endpoint:
+
+```text
+POST /inference
+Content-Type: multipart/form-data
+
+file             binary   WAV audio
+language         string   configured language or "auto"
+response_format  string   "json"
+temperature      string   default "0.0"
+temperature_inc  string   default "0.2"
+prompt           string   optional initial prompt
+```
+
+Expected response is the same minimum JSON shape:
+
+```json
+{ "text": "hello world" }
+```
+
+Transcription and post-editing are separate stages:
+
+1. The selected transcription backend turns audio into raw text.
+2. If post-editing is enabled for the session or selected from preview, the raw
+   text is sent to the selected post-edit provider.
+
+`openai_transcription_model` and `transcription_prompt.md` apply only when
+`transcription_backend` is `openai`. They are not used by the local `/transcribe`
+or whisper.cpp transcription backends.
+
+Post-editing always uses the profile prompt files:
+
+- `dev_post_edit_prompt.md`
+- `pro_post_edit_prompt.md`
+- `personal_post_edit_prompt.md`
+
+Each profile prompt has `System`, `Developer`, and `User` sections. The hosted
+OpenAI provider sends those through the Responses API as system/developer/user
+input messages. The `openai_compatible` provider sends them through a local
+Chat Completions-compatible endpoint; by default it maps the developer section
+to another system message because many local servers do not support the newer
+`developer` role.
 
 ---
 
@@ -350,11 +394,21 @@ while the post-edit prompt can stay focused on stronger restructuring and coding
 
 | Key | Default | Description |
 |---|---|---|
-| `server_url` | `http://…/transcribe` | Transcription server endpoint |
-| `transcription_backend` | `http` | `http` uses the configured `/transcribe` endpoint. `openai` sends WAV audio directly to OpenAI speech-to-text. |
+| `server_url` | `http://…/transcribe` | Generic local transcription server endpoint used when `transcription_backend` is `http`. |
+| `whisper_cpp_url` | `http://127.0.0.1:8080/inference` | whisper.cpp server endpoint used when `transcription_backend` is `whispercpp`. |
+| `whisper_cpp_temperature` | `0.0` | Temperature sent to the whisper.cpp `/inference` endpoint. |
+| `whisper_cpp_temperature_inc` | `0.2` | Temperature increment sent to whisper.cpp when decoding fallback is needed. |
+| `whisper_cpp_prompt` | `""` | Optional whisper.cpp initial prompt/context. This is separate from the OpenAI instruction-style transcription prompt. |
+| `transcription_backend` | `http` | `http` uses the configured `/transcribe` endpoint. `whispercpp` uses a whisper.cpp `/inference` endpoint. `openai` sends WAV audio directly to OpenAI speech-to-text. |
 | `openai_transcription_model` | `gpt-4o-mini-transcribe` | OpenAI speech-to-text model used when `transcription_backend` is `openai`. |
-| `post_edit_provider` | `openai` | Post-edit backend. `openai` calls the OpenAI Responses API. `external` sends the rendered profile prompt to `external_post_edit_url`. |
+| `post_edit_provider` | `openai` | Post-edit backend. `openai` calls the OpenAI Responses API. `openai_compatible` calls a local Chat Completions-compatible server. `external` sends the rendered profile prompt to `external_post_edit_url`. |
 | `external_post_edit_url` | `http://127.0.0.1:8010/external_postedit` | Local/proxy post-edit endpoint used when `post_edit_provider` is `external`. |
+| `openai_compatible_post_edit_url` | `http://127.0.0.1:1234/v1/chat/completions` | Local OpenAI-compatible Chat Completions endpoint used when `post_edit_provider` is `openai_compatible`. |
+| `openai_compatible_post_edit_model` | `""` | Model name sent to the local OpenAI-compatible post-edit server. The Post-Edit tab can fetch `/v1/models` and fill this from the compatible endpoint. |
+| `openai_compatible_post_edit_temperature` | `0.0` | Temperature sent to the local OpenAI-compatible post-edit server. |
+| `openai_compatible_post_edit_api_key_env` | `""` | Optional environment variable for a local server bearer token. Empty means no `Authorization` header is sent. |
+| `openai_compatible_post_edit_developer_role` | `system` | Role used for the rendered developer prompt on local OpenAI-compatible servers. `system` is the safest default; use `developer` only if your server supports that role. |
+| `openai_compatible_post_edit_json_mode` | `false` | When `true`, sends `response_format: {"type": "json_object"}` to the local compatible server. Default is off for broader local-server compatibility. |
 | `hotkey` | `ctrl+shift+space` | Main push-to-talk hotkey. Hold to record, release to transcribe. Insertion is chosen automatically: console-like fields use typed input, normal editors use fast paste. |
 | `fast_hotkey` | `""` | Optional push-to-talk override that always uses fast paste / dump. Empty = disabled. |
 | `undo_hotkey` | `""` | Optional hotkey to re-insert the last successful transcription into the current target using the current insertion logic. Empty = disabled. |
@@ -418,9 +472,12 @@ Right-click the tray icon for the context menu:
 
 ## Settings dialog
 
-Right-click the tray icon and choose **Settings...**. The window has tabs for core settings, LLM/post-edit settings, microphone testing, and input-class routing, plus a persistent history panel below them. Click **Save** to write changes to `config.json` and the prompt Markdown files; closing with X discards unsaved changes.
+Right-click the tray icon and choose **Settings...**. The window has tabs for microphone selection, advanced recording/hotkey behavior, OpenAI transcription settings, post-edit settings, microphone testing, and input-class routing, plus a persistent history panel below them. Click **Save** to write changes to `config.json` and the prompt Markdown files; closing with X discards unsaved changes.
 
-### Settings tab
+### Advanced tab
+
+- **Backend** - choose generic local HTTP, whisper.cpp, or OpenAI speech-to-text.
+- **Whisper.cpp URL** - endpoint shown when the `whispercpp` backend is selected, usually `http://127.0.0.1:8080/inference`.
 
 - **Server URL** — transcription endpoint
 - **Hotkey** — main push-to-talk combination, with live validation and a **Capture** button
@@ -432,13 +489,21 @@ Right-click the tray icon and choose **Settings...**. The window has tabs for co
 - **Live transcription mode** — when checked, each sentence is streamed to the field as it arrives and status is shown via a cursor-side overlay dot instead of characters in the field. When unchecked (default), all chunks are collected and typed at once.
 - **Simple mode** — classic mode only; greyed out when live mode is on. When checked (default), the status indicators are plain `®` (listening) and `¿` (transcribing) — a single character each, reliable over SSH and RDP. When unchecked, animated block-shade and corner-spin characters are used instead.
 
-### LLM tab
+### Microphone tab
+
+- **Microphone** - choose the recording device used for push-to-talk.
+
+### Transcription AI tab
+
+- **Transcribe model** - OpenAI speech-to-text model used only when the transcription backend is `openai`.
+- **Transcribe prompt** - cleanup-oriented prompt stored in `transcription_prompt.md`; local HTTP and whisper.cpp backends do not use it.
+
+### Post-Edit tab
 
 - **API key env** - shows whether `OPENAI_API_KEY` is set. The key is never saved to `config.json`.
 - **Post-edit model** - OpenAI model used for post-editing completed transcripts.
+- **Compatible URL / model / temp** - settings for a locally hosted OpenAI-compatible Chat Completions post-edit server.
 - **Reasoning effort** - reasoning setting passed to the OpenAI Responses API for post-editing.
-- **Transcription backend** - choose local/HTTP transcription or OpenAI speech-to-text.
-- **Transcription model and prompt** - settings for the OpenAI transcription backend and its local `transcription_prompt.md` file.
 - **Toggle key** - key pressed during dictation to cycle post-edit profiles: `off -> dev -> pro -> personal -> off`.
 - **Profile prompts** - shows the resolved paths for the three local profile prompt files.
 - **System / Developer / User prompt editors** - edit and save prompt sections as Markdown instead of embedding long strings in `config.json`.
@@ -595,6 +660,7 @@ When running from source, output goes to the terminal. Enable `"debug": true` in
 | `sherpa_onnx_server.py` | `sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8` | Sherpa-ONNX / ONNX Runtime style runtime | Linux machines where a small, low-drama local server matters more than GPU use | Recommended default |
 | `parakeet_server.py` | `nvidia/parakeet-tdt-0.6b-v3` | NVIDIA NeMo + PyTorch | CUDA machines where the NeMo stack is already known-good | Original server |
 | Any external `/transcribe` server | Any compatible ASR model | Anything | Existing faster-whisper, cloud, or custom ASR endpoints | Supported by contract |
+| whisper.cpp server | Any whisper.cpp model | whisper.cpp `/inference` | Existing whisper.cpp deployments, usually on port `8080` | Use `transcription_backend: "whispercpp"` |
 
 The ONNX server still runs Parakeet TDT 0.6B v3, but it runs a converted int8
 Sherpa-ONNX package instead of loading the original Hugging Face model through
@@ -735,6 +801,16 @@ All local server variants start on `http://localhost:8001` by default. Once
 
 ```json
 { "server_url": "http://localhost:8001/transcribe" }
+```
+
+For a whisper.cpp server, select the `whispercpp` backend and point the
+dedicated URL at `/inference`:
+
+```json
+{
+  "transcription_backend": "whispercpp",
+  "whisper_cpp_url": "http://127.0.0.1:8080/inference"
+}
 ```
 
 If the post-editor proxy is running, point the client at the proxy instead:

@@ -22,9 +22,14 @@ Minimum successful response:
 |---|---|---|---|
 | `sherpa_onnx_server.py` | Sherpa-ONNX | `sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8` | Default Linux path, especially on constrained machines |
 | `parakeet_server.py` | NVIDIA NeMo + PyTorch | `nvidia/parakeet-tdt-0.6b-v3` | Original Parakeet path for CUDA machines with a known-good Torch stack |
+| whisper.cpp server | whisper.cpp | Any whisper.cpp model | Existing whisper.cpp deployments using `/inference` |
 
 The Sherpa-ONNX model is still Parakeet TDT 0.6B v3, but converted and int8
 quantized for ONNX/Sherpa instead of loaded through NeMo.
+
+The client also has a dedicated `whispercpp` backend for stock whisper.cpp
+servers. It posts WAV audio to `http://127.0.0.1:8080/inference` by default,
+with `response_format=json`, and reads the returned `text` field.
 
 ## Sherpa-ONNX Quick Start
 

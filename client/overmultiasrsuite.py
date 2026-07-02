@@ -16,6 +16,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 import audioop
 from pathlib import Path
 
@@ -90,6 +91,10 @@ POST_EDIT_PROFILES = ("dev", "pro", "personal")
 DEFAULT_CONFIG = {
     "transcription_backend": "http",
     "server_url": "http://127.0.0.1:8001/transcribe",
+    "whisper_cpp_url": "http://127.0.0.1:8080/inference",
+    "whisper_cpp_temperature": "0.0",
+    "whisper_cpp_temperature_inc": "0.2",
+    "whisper_cpp_prompt": "",
     "openai_transcription_model": "gpt-4o-mini-transcribe",
     "openai_transcription_prompt_markdown_file": DEFAULT_TRANSCRIPTION_PROMPT_FILE,
     "openai_transcription_prompt": (
@@ -119,12 +124,30 @@ DEFAULT_CONFIG = {
     "fast_post_edit_mode": False,
     "post_edit_provider": "openai",
     "external_post_edit_url": "http://127.0.0.1:8010/external_postedit",
+    "openai_compatible_post_edit_url": "http://127.0.0.1:1234/v1/chat/completions",
+    "openai_compatible_post_edit_model": "",
+    "openai_compatible_dev_post_edit_model": "",
+    "openai_compatible_pro_post_edit_model": "",
+    "openai_compatible_personal_post_edit_model": "",
+    "openai_compatible_post_edit_temperature": 0.0,
+    "openai_compatible_post_edit_api_key_env": "",
+    "openai_compatible_post_edit_developer_role": "system",
+    "openai_compatible_post_edit_json_mode": False,
+    "external_post_edit_model": "gpt-5-mini",
+    "external_dev_post_edit_model": "",
+    "external_pro_post_edit_model": "",
+    "external_personal_post_edit_model": "",
     "openai_model": "gpt-5-mini",
+    "openai_dev_post_edit_model": "",
+    "openai_pro_post_edit_model": "",
+    "openai_personal_post_edit_model": "",
     "openai_reasoning_effort": "low",
     "openai_prompt_markdown_file": DEFAULT_PROMPT_FILE,
     "editor_notes_overlay_seconds": 4.0,
     "editor_notes_chars_per_extra_second": 45.0,
     "post_edit_toggle_key": "y",
+    "post_edit_preview_auto_insert": False,
+    "post_edit_review_copy_includes_notes": True,
     "main_review_non_post_edit_sessions": False,
     "fast_review_non_post_edit_sessions": False,
     "preview_max_width": 860,
@@ -166,12 +189,38 @@ DEFAULT_CONFIG = {
 }
 
 
+def _normalize_transcription_backend(value: str | None) -> str:
+    backend = (value or DEFAULT_CONFIG["transcription_backend"]).strip().lower()
+    backend = backend.replace("-", "_")
+    if backend in {"local", "server", "generic", "generic_http"}:
+        return "http"
+    if backend in {"whisper.cpp", "whisper_cpp", "whispercpp"}:
+        return "whispercpp"
+    if backend == "openai":
+        return "openai"
+    return "http"
+
+
+def _normalize_post_edit_provider(value: str | None) -> str:
+    provider = (value or DEFAULT_CONFIG["post_edit_provider"]).strip().lower()
+    provider = provider.replace("-", "_")
+    if provider in {"external", "proxy", "local"}:
+        return "external"
+    if provider in {"openai_compatible", "openai_compat", "local_openai", "local_openai_compatible", "compatible"}:
+        return "openai_compatible"
+    if provider == "openai":
+        return "openai"
+    return "openai"
+
+
 def load_config() -> dict:
     if CONFIG_FILE.exists():
         with open(CONFIG_FILE, encoding="utf-8") as f:
             cfg = json.load(f)
         for k, v in DEFAULT_CONFIG.items():
             cfg.setdefault(k, v)
+        cfg["transcription_backend"] = _normalize_transcription_backend(cfg.get("transcription_backend"))
+        cfg["post_edit_provider"] = _normalize_post_edit_provider(cfg.get("post_edit_provider"))
         legacy_prompt = cfg.get("openai_post_edit_prompt")
         if legacy_prompt:
             cfg.setdefault("openai_user_prompt_template", legacy_prompt)
@@ -209,6 +258,7 @@ def save_config(cfg: dict):
     _save_prompt_markdown(cfg)
     _save_transcription_prompt_markdown(cfg)
     cfg.pop("openai_api_key", None)
+    cfg.pop("openai_compatible_post_edit_api_key", None)
     cfg.pop("openai_context_markdown_file", None)
     cfg.pop("review_non_post_edit_sessions", None)
     cfg.pop("openai_transcription_prompt", None)
@@ -246,6 +296,19 @@ def _history_text_is_meaningful(text: str | None) -> bool:
     return len(words) >= 2
 
 
+def _final_transcription_skip_reason(text: str | None) -> str | None:
+    stripped = (text or "").strip()
+    if not stripped:
+        return "empty final transcription"
+    sentinel = re.sub(r"[\s_]+", " ", stripped.strip("[](){} \t\r\n.。")).lower()
+    if sentinel == "blank audio":
+        return "blank-audio marker"
+    words = re.findall(r"\b[\w']+\b", stripped, flags=re.UNICODE)
+    if len(words) < 4:
+        return f"too short ({len(words)} words)"
+    return None
+
+
 def _load_history():
     if _HISTORY_FILE.exists():
         try:
@@ -271,6 +334,74 @@ def _add_to_history(entry: dict):
         return
     _history.append(entry)
     _save_history()
+
+
+def _format_history_seconds(value) -> str | None:
+    try:
+        seconds = float(value)
+    except Exception:
+        return None
+    if seconds < 0:
+        return None
+    if seconds < 10:
+        return f"{seconds:.1f}s"
+    return f"{seconds:.0f}s"
+
+
+def _format_history_rtf(value) -> str | None:
+    try:
+        rtf = float(value)
+    except Exception:
+        return None
+    if rtf < 0:
+        return None
+    if rtf < 1:
+        return f"{rtf:.2f}x"
+    return f"{rtf:.1f}x"
+
+
+def _audio_duration_seconds(audio: np.ndarray | None, sample_rate: int | float | None) -> float | None:
+    if audio is None:
+        return None
+    try:
+        sr = float(sample_rate or 0)
+    except Exception:
+        return None
+    if sr <= 0:
+        return None
+    return len(audio) / sr
+
+
+def _rtf(transcription_seconds: float | None, audio_seconds: float | None) -> float | None:
+    if transcription_seconds is None or audio_seconds is None or audio_seconds <= 0:
+        return None
+    return transcription_seconds / audio_seconds
+
+
+def _history_status_line(entry: dict) -> str:
+    parts: list[str] = []
+    ts = (entry.get("time") or "").strip()
+    if ts:
+        parts.append(ts)
+
+    transcription_seconds = _format_history_seconds(entry.get("transcription_seconds"))
+    if transcription_seconds:
+        parts.append(f"T: {transcription_seconds}")
+
+    transcription_rtf = _format_history_rtf(entry.get("transcription_rtf"))
+    if transcription_rtf:
+        parts.append(f"RTF {transcription_rtf}")
+
+    post_edit_enabled = bool(entry.get("post_edit_enabled", entry.get("post_edit_active", False)))
+    if post_edit_enabled:
+        profile = _post_edit_profile_name(
+            entry.get("post_edit_profile") or entry.get("post_edit_profile_requested")
+        )
+        parts.append(f"PE: {profile or 'on'}")
+    elif "post_edit_enabled" in entry or "post_edit_active" in entry:
+        parts.append("PE: off")
+
+    return " | ".join(parts)
 
 
 def _openai_api_key() -> str:
@@ -685,6 +816,8 @@ _user32 = ctypes.windll.user32
 _input_size = ctypes.sizeof(_INPUT)
 _user32.SendInput.argtypes = (ctypes.c_uint, ctypes.POINTER(_INPUT), ctypes.c_int)
 _user32.SendInput.restype = ctypes.c_uint
+_user32.GetAsyncKeyState.argtypes = (ctypes.c_int,)
+_user32.GetAsyncKeyState.restype = ctypes.c_short
 _user32.OpenClipboard.argtypes = (ctypes.wintypes.HWND,)
 _user32.OpenClipboard.restype = ctypes.c_bool
 _user32.CloseClipboard.argtypes = ()
@@ -991,6 +1124,7 @@ CF_UNICODETEXT = 13
 GMEM_MOVEABLE = 0x0002
 VK_CONTROL = 0x11
 VK_V = 0x56
+_PASTE_MODIFIER_VKS = (0x10, 0x11, 0x12, 0x5B, 0x5C, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5)
 MOUSEEVENTF_RIGHTDOWN = 0x0008
 MOUSEEVENTF_RIGHTUP = 0x0010
 _kernel32 = ctypes.windll.kernel32
@@ -1039,10 +1173,27 @@ def _send_right_click():
 
 def _release_possible_modifiers():
     """Defensively release modifiers in case a suppressed hotkey leaves state behind."""
-    for vk in (0x10, 0x11, 0x12, 0x5B, 0x5C, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5):
+    for vk in _PASTE_MODIFIER_VKS:
         ki = _KEYBDINPUT(vk, 0, KEYEVENTF_KEYUP, 0, 0)
         arr = (_INPUT * 1)(_INPUT(INPUT_KEYBOARD, _INPUT_UNION(ki=ki)))
         _user32.SendInput(1, arr, _input_size)
+
+
+def _modifiers_are_physically_down() -> bool:
+    return any(_user32.GetAsyncKeyState(vk) & 0x8000 for vk in _PASTE_MODIFIER_VKS)
+
+
+def _prepare_paste_trigger(method: str):
+    """Avoid Ctrl/Shift/Alt/Win contaminating a synthetic paste gesture."""
+    deadline = time.time() + 0.35
+    waited = False
+    while _modifiers_are_physically_down() and time.time() < deadline:
+        waited = True
+        time.sleep(0.01)
+    if waited:
+        print(f"[PASTE] Waited for hotkey modifiers before {method}.", flush=True)
+    _release_possible_modifiers()
+    time.sleep(0.04 if method == "paste_right_click" else 0.02)
 
 
 def _clipboard_get_text() -> str | None:
@@ -1096,6 +1247,7 @@ def paste_text(text: str, method: str = "paste_ctrl_v", source: str = "session")
         preview = _safe_console_text(repr(text[:80]))
         print(f"[PASTE] Preparing {method} from {source} with {len(text)} chars.", flush=True)
         print(f"[PASTE] Outgoing preview: {preview}", flush=True)
+        _prepare_paste_trigger(method)
         _clipboard_set_text(text)
         confirm = _clipboard_get_text()
         print(f"[PASTE] Clipboard populated with outgoing text (readback match={confirm == text}).", flush=True)
@@ -1557,6 +1709,64 @@ def _record_with_vad(
                     pass
         toggle_y_down = y_down
 
+    def _process_vad_block(blk: np.ndarray):
+        nonlocal current, spk, chunk_peak, rms_min, rms_max, in_speech, hangover, sil_count
+        frames = len(blk)
+        all_data.append(blk)
+        current.append(blk)
+        rms = float(np.sqrt(np.mean(blk.astype(np.float64) ** 2)))
+        if rms < rms_min:
+            rms_min = rms
+        if rms > rms_max:
+            rms_max = rms
+        spk += frames
+
+        if rms >= sil_rms:
+            chunk_peak = max(chunk_peak, rms)
+            in_speech = True
+            hangover = HANGOVER_SAMPLES
+            sil_count = 0
+        elif hangover > 0:
+            hangover = max(0, hangover - frames)
+            sil_count = 0
+        else:
+            in_speech = False
+            sil_count += frames
+
+        if config.get("debug"):
+            print(
+                f"[VAD] rms={rms:.0f} speech={in_speech} hang={hangover} "
+                f"sil={sil_count}/{SIL_SAMPLES} peak={chunk_peak:.0f}",
+                flush=True,
+            )
+
+        if sil_count >= SIL_SAMPLES and spk >= SPEECH_SAMPLES and current:
+            if chunk_peak >= sil_rms:
+                _submit(np.concatenate(current))
+                current = []
+            else:
+                kept = []
+                kept_samples = 0
+                for block in reversed(current):
+                    kept.insert(0, block)
+                    kept_samples += len(block)
+                    if kept_samples >= SIL_SAMPLES:
+                        break
+                current = kept
+                print(
+                    f"[VAD] Silence window, no speech "
+                    f"(peak={chunk_peak:.0f} < {sil_rms}) - carrying tail forward",
+                    flush=True,
+                )
+            _reset_chunk()
+
+        chunk_dur = sum(len(block) for block in current) / native_sr if current else 0.0
+        if chunk_dur >= max_chunk_s and chunk_peak >= sil_rms:
+            print(f"[VAD] Max chunk duration {max_chunk_s}s reached - sending", flush=True)
+            _submit(np.concatenate(current))
+            current = []
+            _reset_chunk()
+
     try:
         if toggle_enabled and insert_mode == "paste_right_click":
             try:
@@ -1599,24 +1809,12 @@ def _record_with_vad(
                     dtype="int16",
                     blocksize=max(512, int(0.10 * native_sr)),
                 ) as stream:
-                    print(f"[REC] Recording (InputStream at {native_sr} Hz, max {max_record_s:.1f}s)...", flush=True)
+                    print(f"[REC] Recording (InputStream at {native_sr} Hz, chunk max {max_record_s:.1f}s)...", flush=True)
                     started_at = time.time()
-                    while (
-                        (_native_hotkeys.is_pressed(hotkey_name) if _native_hotkeys else keyboard.is_pressed(config["hotkey"]))
-                        and time.time() - started_at < max_record_s
-                    ):
+                    while _hotkey_is_down_now(hotkey_name, config):
                         _handle_post_edit_toggle()
                         data, _ = stream.read(max(512, int(0.10 * native_sr)))
-                        blk = data.copy()
-                        all_data.append(blk)
-                        current.append(blk)
-                        rms = float(np.sqrt(np.mean(blk.astype(np.float64) ** 2)))
-                        if rms < rms_min:
-                            rms_min = rms
-                        if rms > rms_max:
-                            rms_max = rms
-                        chunk_peak = max(chunk_peak, rms)
-                        spk += len(blk)
+                        _process_vad_block(data.copy())
                 recording = np.concatenate(all_data) if all_data else np.empty((0, 1), dtype=np.int16)
                 max_record_samples = len(recording)
             except Exception:
@@ -1626,7 +1824,7 @@ def _record_with_vad(
 
         reached_limit = False
         started_at = time.time()
-        while recording is not None and len(all_data) == 0 and (_native_hotkeys.is_pressed(hotkey_name) if _native_hotkeys else keyboard.is_pressed(config["hotkey"])):
+        while recording is not None and len(all_data) == 0 and _hotkey_is_down_now(hotkey_name, config):
             _handle_post_edit_toggle()
 
             if time.time() - started_at >= max_record_s:
@@ -1664,7 +1862,7 @@ def _record_with_vad(
         rec_chunk_samples = max(512, int(0.10 * native_sr))
         if not skip_legacy_chunk_recorder:
             print(f"[REC] Recording (VAD, sd.rec chunks at {native_sr} Hz)...", flush=True)
-        while (not skip_legacy_chunk_recorder) and (_native_hotkeys.is_pressed(hotkey_name) if _native_hotkeys else keyboard.is_pressed(config["hotkey"])):
+        while (not skip_legacy_chunk_recorder) and _hotkey_is_down_now(hotkey_name, config):
                 y_down = False
                 if toggle_enabled:
                     try:
@@ -1917,6 +2115,145 @@ def _openai_input_from_messages(messages: list[dict]) -> list[dict]:
     ]
 
 
+def _openai_compatible_api_key(config: dict) -> str:
+    env_name = (config.get("openai_compatible_post_edit_api_key_env") or "").strip()
+    return os.getenv(env_name, "").strip() if env_name else ""
+
+
+def _openai_compatible_models_url(chat_url: str) -> str:
+    parts = urllib.parse.urlsplit((chat_url or "").strip())
+    path = parts.path.rstrip("/")
+    for suffix in ("/chat/completions", "/responses", "/completions"):
+        if path.endswith(suffix):
+            path = path[: -len(suffix)]
+            break
+    path = (path or "/v1").rstrip("/") + "/models"
+    return urllib.parse.urlunsplit((parts.scheme, parts.netloc, path, "", ""))
+
+
+def _preferred_openai_compatible_model(models: list[str], current: str) -> str:
+    current = (current or "").strip()
+    if current and current != DEFAULT_CONFIG["openai_compatible_post_edit_model"] and current in models:
+        return current
+    preferred = (
+        "gpt-5.4-low",
+        "gpt-5.4-mini",
+        "gpt-5.4-mini-low",
+        "gpt-5.3-codex-spark",
+    )
+    for model in preferred:
+        if model in models:
+            return model
+    return models[0] if models else current
+
+
+def _fetch_openai_compatible_models(url: str, headers: dict | None = None, timeout: int = 10) -> list[str]:
+    resp = requests.get(_openai_compatible_models_url(url), headers=headers or {}, timeout=timeout)
+    resp.raise_for_status()
+    body = resp.json()
+    models = [
+        str(item.get("id") or "").strip()
+        for item in body.get("data", [])
+        if isinstance(item, dict) and str(item.get("id") or "").strip()
+    ]
+    return sorted(dict.fromkeys(models))
+
+
+def _post_edit_provider_model_key(provider: str) -> str:
+    provider = _normalize_post_edit_provider(provider)
+    if provider == "openai_compatible":
+        return "openai_compatible_post_edit_model"
+    if provider == "external":
+        return "external_post_edit_model"
+    return "openai_model"
+
+
+def _post_edit_profile_model_key(provider: str, profile: str) -> str:
+    provider = _normalize_post_edit_provider(provider)
+    profile_name = _post_edit_profile_name(profile) or POST_EDIT_PROFILES[0]
+    if provider == "openai_compatible":
+        return f"openai_compatible_{profile_name}_post_edit_model"
+    if provider == "external":
+        return f"external_{profile_name}_post_edit_model"
+    return f"openai_{profile_name}_post_edit_model"
+
+
+def _post_edit_model_for_provider(config: dict, provider: str, edit_profile: str) -> str:
+    provider = _normalize_post_edit_provider(provider)
+    profile_key = _post_edit_profile_model_key(provider, edit_profile)
+    provider_key = _post_edit_provider_model_key(provider)
+    return (
+        config.get(profile_key)
+        or config.get(provider_key)
+        or DEFAULT_CONFIG.get(provider_key, "")
+    ).strip()
+
+
+def _openai_post_edit_model(config: dict, edit_profile: str) -> str:
+    return _post_edit_model_for_provider(config, "openai", edit_profile)
+
+
+def _openai_compatible_post_edit_model(config: dict, edit_profile: str) -> str:
+    return _post_edit_model_for_provider(config, "openai_compatible", edit_profile)
+
+
+def _openai_compatible_chat_messages(messages: list[dict], config: dict) -> list[dict]:
+    developer_role = (
+        config.get("openai_compatible_post_edit_developer_role")
+        or DEFAULT_CONFIG["openai_compatible_post_edit_developer_role"]
+    ).strip().lower()
+    if developer_role not in {"system", "user", "developer"}:
+        developer_role = "system"
+
+    system_parts: list[str] = [(
+        "Output contract: return only a JSON object with string keys "
+        "`edited_text` and `editor_notes`. Do not wrap it in markdown."
+    )]
+    chat_messages: list[dict] = []
+    for message in messages:
+        content = str(message.get("content") or "").strip()
+        if not content:
+            continue
+        role = str(message.get("role") or "user").strip().lower()
+        if role == "developer":
+            role = developer_role
+        elif role not in {"system", "user", "assistant"}:
+            role = "user"
+        if role == "system":
+            system_parts.append(content)
+        else:
+            chat_messages.append({"role": role, "content": content})
+
+    if system_parts:
+        chat_messages.insert(0, {"role": "system", "content": "\n\n".join(system_parts)})
+    return chat_messages
+
+
+def _parse_json_object_from_text(raw_text: str) -> dict | None:
+    raw_text = (raw_text or "").strip()
+    if not raw_text:
+        return None
+    raw_text = re.sub(r"(?is)<think>.*?</think>", "", raw_text).strip()
+    if raw_text.startswith("```"):
+        raw_text = re.sub(r"^```(?:json)?\s*", "", raw_text, flags=re.IGNORECASE)
+        raw_text = re.sub(r"\s*```$", "", raw_text)
+        raw_text = raw_text.strip()
+    try:
+        parsed = json.loads(raw_text)
+        return parsed if isinstance(parsed, dict) else None
+    except Exception:
+        pass
+    start = raw_text.find("{")
+    end = raw_text.rfind("}")
+    if start >= 0 and end > start:
+        try:
+            parsed = json.loads(raw_text[start:end + 1])
+            return parsed if isinstance(parsed, dict) else None
+        except Exception:
+            return None
+    return None
+
+
 def _validate_post_edit_result(
     edited: str,
     editor_notes: str,
@@ -1954,7 +2291,7 @@ def _post_edit_text_openai(
     prompts: dict[str, str],
 ) -> tuple[str, str, bool]:
     api_key = _openai_api_key()
-    model = (config.get("openai_model") or "").strip()
+    model = _openai_post_edit_model(config, edit_profile)
     reasoning_effort = (config.get("openai_reasoning_effort") or "low").strip().lower()
 
     if not api_key or not model or not messages:
@@ -2018,6 +2355,106 @@ def _post_edit_text_openai(
         return text, "", False
 
 
+def _post_edit_text_openai_compatible(
+    text: str,
+    config: dict,
+    profile: str,
+    edit_profile: str,
+    messages: list[dict],
+    prompts: dict[str, str],
+) -> tuple[str, str, bool]:
+    url = (
+        config.get("openai_compatible_post_edit_url")
+        or DEFAULT_CONFIG["openai_compatible_post_edit_url"]
+    ).strip()
+    model = _openai_compatible_post_edit_model(config, edit_profile)
+    if not url or not messages:
+        print("[POST] OpenAI-compatible post-edit skipped - URL or prompt messages missing.", flush=True)
+        return text, "", False
+
+    payload = {
+        "model": model,
+        "messages": _openai_compatible_chat_messages(messages, config),
+        "temperature": config.get(
+            "openai_compatible_post_edit_temperature",
+            DEFAULT_CONFIG["openai_compatible_post_edit_temperature"],
+        ),
+    }
+    if bool(config.get("openai_compatible_post_edit_json_mode", DEFAULT_CONFIG["openai_compatible_post_edit_json_mode"])):
+        payload["response_format"] = {"type": "json_object"}
+    headers = {"Content-Type": "application/json"}
+    api_key = _openai_compatible_api_key(config)
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    if model in {"", DEFAULT_CONFIG["openai_compatible_post_edit_model"]}:
+        try:
+            models = _fetch_openai_compatible_models(url, headers=headers, timeout=10)
+            selected = _preferred_openai_compatible_model(models, model)
+            if selected:
+                model = selected
+                print(f"[POST] Auto-selected OpenAI-compatible model: {model}", flush=True)
+        except Exception as exc:
+            print(f"[POST] OpenAI-compatible model auto-select failed: {_safe_console_text(exc)}", flush=True)
+    if not model:
+        print("[POST] OpenAI-compatible post-edit skipped - model missing.", flush=True)
+        return text, "", False
+
+    def _send(request_payload: dict):
+        return requests.post(url, headers=headers, json=request_payload, timeout=90)
+
+    print(f"[POST] Sending transcript to OpenAI-compatible post-editor via {url} ({model}, {profile}/{edit_profile}).", flush=True)
+    try:
+        resp = _send(payload)
+        if resp.status_code in {400, 404, 422}:
+            print(
+                "[POST] OpenAI-compatible server rejected the full chat payload; retrying with minimal model/messages payload.",
+                flush=True,
+            )
+            fallback_payload = {
+                "model": model,
+                "messages": payload["messages"],
+            }
+            resp = _send(fallback_payload)
+
+        print(f"[POST] OpenAI-compatible HTTP {resp.status_code}", flush=True)
+        print(f"[POST] OpenAI-compatible response: {_safe_console_text(resp.text)}", flush=True)
+        resp.raise_for_status()
+        body = resp.json()
+        choices = body.get("choices") or []
+        raw_text = ""
+        if choices:
+            message = choices[0].get("message") or {}
+            content = message.get("content") or ""
+            if isinstance(content, list):
+                raw_text = "\n".join(
+                    str(part.get("text") or "")
+                    for part in content
+                    if isinstance(part, dict)
+                ).strip()
+            else:
+                raw_text = str(content).strip()
+
+        if not raw_text:
+            print("[POST] No chat completion content returned - keeping original transcript.", flush=True)
+            return text, "", False
+
+        print(f"[POST] Chat completion content: {_safe_console_text(raw_text)}", flush=True)
+        parsed = _parse_json_object_from_text(raw_text)
+        if not parsed:
+            print("[POST] Chat completion content was not parseable JSON - keeping original transcript.", flush=True)
+            return text, "", False
+        return _validate_post_edit_result(
+            parsed.get("edited_text") or parsed.get("text") or "",
+            parsed.get("editor_notes") or "",
+            text,
+            prompts,
+        )
+    except Exception as exc:
+        print(f"[POST] OpenAI-compatible post-edit failed: {_safe_console_text(exc)}", flush=True)
+        return text, "", False
+
+
 def _post_edit_text_external(
     text: str,
     config: dict,
@@ -2027,7 +2464,7 @@ def _post_edit_text_external(
     prompts: dict[str, str],
 ) -> tuple[str, str, bool]:
     url = (config.get("external_post_edit_url") or DEFAULT_CONFIG["external_post_edit_url"]).strip()
-    model = (config.get("openai_model") or "").strip()
+    model = _post_edit_model_for_provider(config, "external", edit_profile)
     if not url or not model or not messages:
         print("[POST] External post-edit skipped - proxy URL, model, or prompt messages missing.", flush=True)
         return text, "", False
@@ -2061,17 +2498,25 @@ def _post_edit_text_external(
 def _post_edit_text(text: str, config: dict, profile: str, edit_profile: str = "dev") -> tuple[str, str, bool]:
     edit_profile = _post_edit_profile_name(edit_profile) or "dev"
     messages, prompts = _render_post_edit_messages(text, config, edit_profile)
-    provider = (config.get("post_edit_provider") or DEFAULT_CONFIG["post_edit_provider"]).strip().lower()
-    if provider in {"external", "proxy", "local"}:
+    provider = _normalize_post_edit_provider(config.get("post_edit_provider"))
+    if provider == "external":
         return _post_edit_text_external(text, config, profile, edit_profile, messages, prompts)
+    if provider == "openai_compatible":
+        return _post_edit_text_openai_compatible(text, config, profile, edit_profile, messages, prompts)
     return _post_edit_text_openai(text, config, profile, edit_profile, messages, prompts)
 
 
 def _post_wav_bytes(wav_bytes: bytes, config: dict) -> tuple[str | None, str | None]:
     """Send raw WAV bytes to the configured transcription backend. Returns (text, error)."""
-    backend = (config.get("transcription_backend") or DEFAULT_CONFIG["transcription_backend"]).strip().lower()
+    backend = _normalize_transcription_backend(config.get("transcription_backend"))
     if backend == "openai":
         return _post_wav_bytes_openai(wav_bytes, config)
+    if backend == "whispercpp":
+        return _post_wav_bytes_whisper_cpp(wav_bytes, config)
+    return _post_wav_bytes_http(wav_bytes, config)
+
+
+def _post_wav_bytes_http(wav_bytes: bytes, config: dict) -> tuple[str | None, str | None]:
     url  = config["server_url"]
     lang = config.get("language")
     print(f"[API] {len(wav_bytes)//1024} KB -> {url}...", flush=True)
@@ -2100,6 +2545,68 @@ def _post_wav_bytes(wav_bytes: bytes, config: dict) -> tuple[str | None, str | N
         msg = "Transcription failed"
     print(f"[API] Error: {msg}", flush=True)
     return None, msg
+
+
+def _post_wav_bytes_whisper_cpp(wav_bytes: bytes, config: dict) -> tuple[str | None, str | None]:
+    url = (config.get("whisper_cpp_url") or DEFAULT_CONFIG["whisper_cpp_url"]).strip()
+    lang = (config.get("language") or "auto").strip()
+    prompt = (config.get("whisper_cpp_prompt") or "").strip()
+    data = {
+        "response_format": "json",
+        "temperature": str(config.get("whisper_cpp_temperature", DEFAULT_CONFIG["whisper_cpp_temperature"])),
+        "temperature_inc": str(config.get("whisper_cpp_temperature_inc", DEFAULT_CONFIG["whisper_cpp_temperature_inc"])),
+        "language": lang,
+    }
+    if prompt:
+        data["prompt"] = prompt
+
+    print(f"[API] {len(wav_bytes)//1024} KB -> whisper.cpp {url}...", flush=True)
+    try:
+        resp = requests.post(
+            url,
+            files={"file": ("audio.wav", wav_bytes, "audio/wav")},
+            data=data,
+            timeout=60,
+        )
+        print(f"[API] HTTP {resp.status_code}", flush=True)
+        print(f"[API] Response: {_safe_console_text(resp.text)}", flush=True)
+        resp.raise_for_status()
+        try:
+            body = resp.json()
+            text = (body.get("text") or "").strip()
+            if not text and isinstance(body.get("transcription"), list):
+                parts = [
+                    str(item.get("text") or "").strip()
+                    for item in body["transcription"]
+                    if isinstance(item, dict)
+                ]
+                text = " ".join(part for part in parts if part).strip()
+        except ValueError:
+            text = resp.text.strip()
+        text = _single_line_whisper_cpp_text(text)
+        print(f"[API] Got: {_safe_console_text(repr(text))}", flush=True)
+        if not text:
+            msg = "Empty whisper.cpp transcription (server returned no text)"
+            print(f"[API] Error: {msg}", flush=True)
+            return None, msg
+        return text or None, None
+    except requests.exceptions.ConnectionError:
+        msg = "whisper.cpp unavailable"
+    except requests.exceptions.Timeout:
+        msg = "whisper.cpp request timed out"
+    except requests.exceptions.HTTPError as exc:
+        code = getattr(exc.response, "status_code", "?")
+        msg = f"whisper.cpp error (HTTP {code})"
+    except requests.RequestException:
+        msg = "whisper.cpp transcription failed"
+    print(f"[API] Error: {msg}", flush=True)
+    return None, msg
+
+
+def _single_line_whisper_cpp_text(text: str) -> str:
+    text = re.sub(r"[ \t]*[\r\n]+[ \t]*", " ", text or "")
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    return text.strip()
 
 
 def _post_wav_bytes_openai(wav_bytes: bytes, config: dict) -> tuple[str | None, str | None]:
@@ -2205,7 +2712,16 @@ def retry_transcription(wav_path: str, time_key: str, config: dict) -> tuple[str
     path = Path(wav_path)
     if not path.exists():
         return None, f"WAV file not found: {path.name}"
+    audio_seconds = None
+    try:
+        info = sf.info(str(path))
+        if info.samplerate:
+            audio_seconds = info.frames / info.samplerate
+    except Exception:
+        audio_seconds = None
+    transcription_started = time.perf_counter()
     text, error = _post_wav_to_server(path, config)
+    transcription_seconds = time.perf_counter() - transcription_started
     if text:
         # Update the existing history entry in-place (deque items are dicts — mutable)
         for entry in _history:
@@ -2213,6 +2729,13 @@ def retry_transcription(wav_path: str, time_key: str, config: dict) -> tuple[str
                 entry.pop("error", None)
                 entry.pop("wav",   None)
                 entry["text"] = text
+                entry["audio_seconds"] = round(audio_seconds, 3) if audio_seconds is not None else None
+                entry["transcription_seconds"] = round(transcription_seconds, 3)
+                entry["transcription_rtf"] = round(_rtf(transcription_seconds, audio_seconds), 4) if _rtf(transcription_seconds, audio_seconds) is not None else None
+                entry["post_edit_enabled"] = False
+                entry["post_edit_seconds"] = None
+                entry["post_edit_success"] = None
+                entry["post_edit_active"] = False
                 break
         _save_history()
         try:
@@ -2742,13 +3265,29 @@ def _preview_overlay_main():
     review_scroll = tk.Scrollbar(review, orient="vertical", command=review_text.yview)
     review_scroll.grid(row=0, column=1, sticky="ns", pady=(10, 6))
     review_text.configure(yscrollcommand=review_scroll.set)
+    review_notes_var = tk.StringVar(value="")
+    review_notes_label = tk.Label(review, text="Editor notes", anchor="w", font=("Segoe UI", 9, "bold"))
+    review_notes_body = tk.Label(review, textvariable=review_notes_var, anchor="nw", justify="left", wraplength=720)
     review_status = tk.Label(review, text="Review and copy manually if you want to paste later.", anchor="w")
     review_status.grid(row=1, column=0, sticky="ew", padx=10)
     review_btns = tk.Frame(review)
-    review_btns.grid(row=2, column=0, columnspan=2, sticky="e", padx=10, pady=(8, 10))
+    review_btns.grid(row=4, column=0, columnspan=2, sticky="e", padx=10, pady=(8, 10))
+    review_include_notes_var = tk.BooleanVar(value=DEFAULT_CONFIG["post_edit_review_copy_includes_notes"])
+    review_include_notes_cb = tk.Checkbutton(
+        review_btns,
+        text="Include editor notes",
+        variable=review_include_notes_var,
+    )
+    review_include_notes_cb.pack(side="left", padx=(0, 12))
+    review_draft_key = [None]
 
     def _copy_review():
-        _draft_review_copy_text(review_text.get("1.0", "end-1c"))
+        text = review_text.get("1.0", "end-1c").strip()
+        draft = _peek_pending_draft()
+        notes = (draft.get("editor_notes") or "").strip() if draft else ""
+        if notes and review_include_notes_var.get():
+            text = f"{text}\n\nEditor notes:\n{notes}".strip()
+        _draft_review_copy_text(text)
         _clear_pending_draft()
 
     def _close_review():
@@ -2805,18 +3344,33 @@ def _preview_overlay_main():
         if review_open:
             wanted = draft.get("text") or ""
             notes = (draft.get("editor_notes") or "").strip()
-            if notes:
-                wanted = f"{wanted}\n\nEditor notes:\n{notes}".strip()
-            current = review_text.get("1.0", "end-1c")
-            if current != wanted:
+            draft_key = (draft.get("profile"), draft.get("post_edit_profile"), draft.get("text"), notes)
+            if review_draft_key[0] != draft_key:
+                review_draft_key[0] = draft_key
+                review_include_notes_var.set(bool(cfg.get(
+                    "post_edit_review_copy_includes_notes",
+                    DEFAULT_CONFIG["post_edit_review_copy_includes_notes"],
+                )))
                 review_text.delete("1.0", "end")
                 review_text.insert("1.0", wanted)
+            review_notes_var.set(notes)
+            if notes:
+                if not review_notes_label.winfo_ismapped():
+                    review_notes_label.grid(row=2, column=0, columnspan=2, sticky="ew", padx=10, pady=(6, 0))
+                    review_notes_body.grid(row=3, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 2))
+                review_include_notes_cb.configure(state="normal")
+            else:
+                if review_notes_label.winfo_ismapped():
+                    review_notes_label.grid_remove()
+                    review_notes_body.grid_remove()
+                review_include_notes_cb.configure(state="disabled")
             if not review.winfo_viewable():
                 review.deiconify()
                 review.lift()
                 review.focus_force()
         elif review.winfo_viewable():
             review.withdraw()
+            review_draft_key[0] = None
 
         if st.get("visible") and not review_open:
             profile = st.get("profile") or "main"
@@ -2856,13 +3410,25 @@ def _preview_overlay_main():
 
 
 def _hotkey_is_down_now(hotkey_name: str, config: dict) -> bool:
+    native_down = False
     if _native_hotkeys is not None:
-        return _native_hotkeys.is_pressed(hotkey_name)
+        native_down = _native_hotkeys.is_pressed(hotkey_name)
     hotkey_text = config.get("fast_hotkey") if hotkey_name == "fast_ptt" else config.get("hotkey")
+    keyboard_down = False
     try:
-        return keyboard.is_pressed(hotkey_text)
+        keyboard_down = keyboard.is_pressed(hotkey_text)
     except Exception:
-        return False
+        keyboard_down = False
+    return native_down or keyboard_down
+
+
+def _wait_for_hotkey_release_before_insert(hotkey_name: str, config: dict):
+    waited = False
+    while _hotkey_is_down_now(hotkey_name, config):
+        waited = True
+        time.sleep(0.01)
+    if waited:
+        print("[HOTKEY] Waited for full hotkey release before inserting result.", flush=True)
 
 
 def reinsert_last_transcription():
@@ -3293,6 +3859,11 @@ def run_session(
                 _hide_preview_overlay()
                 return
 
+            audio_seconds = (
+                _audio_duration_seconds(raw_full_audio, native_sr)
+                or _audio_duration_seconds(full_audio, config.get("sample_rate", 16000))
+            )
+            transcription_started = time.perf_counter()
             _set_preview("Transcribing", preview_text[0], loading=True)
             print("[STATUS] Transcribing (preview)", flush=True)
 
@@ -3327,16 +3898,24 @@ def run_session(
                         errors.append(e)
                         print(f"[VAD] Chunk {i+1} error: {e}", flush=True)
 
+            transcription_seconds = time.perf_counter() - transcription_started
             result = _join_chunks(texts) if texts else None
+            skip_reason = _final_transcription_skip_reason(result)
+            if skip_reason:
+                print(f"[TYPE] Skipping final transcription: {skip_reason}.", flush=True)
+                result = None
             error = errors[0] if errors and not texts else None
             editor_notes = ""
             post_edit_success = False
+            post_edit_seconds = None
 
             if result:
                 _set_preview(text=result)
             if result and post_edit_active and not live_cfg:
                 _set_preview("Post-editing", result, loading=True)
+                post_edit_started = time.perf_counter()
                 result, editor_notes, post_edit_success = _post_edit_text(result, config, profile, post_edit_active)
+                post_edit_seconds = time.perf_counter() - post_edit_started
 
             review_non_post_edit = bool(
                 config.get(
@@ -3345,6 +3924,10 @@ def run_session(
                 )
             )
             auto_insert_without_post_edit = not review_non_post_edit
+            post_edit_preview_auto_insert = bool(config.get(
+                "post_edit_preview_auto_insert",
+                DEFAULT_CONFIG["post_edit_preview_auto_insert"],
+            ))
 
             if result:
                 _set_last_result_text(result)
@@ -3352,10 +3935,20 @@ def run_session(
                     "time": _now_str(),
                     "text": result,
                     "editor_notes": editor_notes,
+                    "audio_seconds": round(audio_seconds, 3) if audio_seconds is not None else None,
+                    "transcription_seconds": round(transcription_seconds, 3),
+                    "transcription_rtf": round(_rtf(transcription_seconds, audio_seconds), 4) if _rtf(transcription_seconds, audio_seconds) is not None else None,
+                    "post_edit_enabled": bool(post_edit_active and not live_cfg),
+                    "post_edit_seconds": round(post_edit_seconds, 3) if post_edit_seconds is not None else None,
+                    "post_edit_success": bool(post_edit_success) if post_edit_active and not live_cfg else None,
                     "post_edit_active": bool(post_edit_success and post_edit_active and not live_cfg),
+                    "post_edit_profile_requested": post_edit_active if post_edit_active and not live_cfg else "",
                     "post_edit_profile": post_edit_active if post_edit_success and post_edit_active and not live_cfg else "",
                 })
-                should_hold_preview = bool(post_edit_active) or not auto_insert_without_post_edit
+                should_hold_preview = (
+                    (bool(post_edit_active) and not (post_edit_success and post_edit_preview_auto_insert))
+                    or (not bool(post_edit_active) and not auto_insert_without_post_edit)
+                )
                 if should_hold_preview:
                     _set_pending_draft(
                         result,
@@ -3380,6 +3973,7 @@ def run_session(
                             "paste_right_click": "Pasting (right click)",
                         }.get(insert_mode, "Typing")
                         print(f"[TYPE] {action} {len(result)} chars into {cls!r}", flush=True)
+                        _wait_for_hotkey_release_before_insert(hotkey_name, config)
                         _last_typed[0] = ""
                         if insert_mode in {"paste_ctrl_v", "paste_right_click"}:
                             paste_text(result, method=insert_mode, source=f"{profile}_result")
@@ -3471,6 +4065,11 @@ def run_session(
                 return
 
             # ── Transcribing indicator ────────────────────────────────────
+            audio_seconds = (
+                _audio_duration_seconds(raw_full_audio, native_sr)
+                or _audio_duration_seconds(full_audio, config.get("sample_rate", 16000))
+            )
+            transcription_started = time.perf_counter()
             if overlay_status:
                 _set_overlay(overlay_transcribing)
             if inline_status and fancy:
@@ -3520,13 +4119,21 @@ def run_session(
                         errors.append(e)
                         print(f"[VAD] Chunk {i+1} error: {e}", flush=True)
 
+            transcription_seconds = time.perf_counter() - transcription_started
             result = _join_chunks(texts) if texts else None
+            skip_reason = _final_transcription_skip_reason(result)
+            if skip_reason:
+                print(f"[TYPE] Skipping final transcription: {skip_reason}.", flush=True)
+                result = None
             error  = errors[0] if errors and not texts else None
 
             editor_notes = ""
             post_edit_success = False
+            post_edit_seconds = None
             if result and post_edit_active and not live_cfg:
+                post_edit_started = time.perf_counter()
                 result, editor_notes, post_edit_success = _post_edit_text(result, config, profile, post_edit_active)
+                post_edit_seconds = time.perf_counter() - post_edit_started
 
             if inline_status and fancy:
                 stop_spin.set()
@@ -3546,7 +4153,14 @@ def run_session(
                     "time": _now_str(),
                     "text": result,
                     "editor_notes": editor_notes,
+                    "audio_seconds": round(audio_seconds, 3) if audio_seconds is not None else None,
+                    "transcription_seconds": round(transcription_seconds, 3),
+                    "transcription_rtf": round(_rtf(transcription_seconds, audio_seconds), 4) if _rtf(transcription_seconds, audio_seconds) is not None else None,
+                    "post_edit_enabled": bool(post_edit_active and not live_cfg),
+                    "post_edit_seconds": round(post_edit_seconds, 3) if post_edit_seconds is not None else None,
+                    "post_edit_success": bool(post_edit_success) if post_edit_active and not live_cfg else None,
                     "post_edit_active": bool(post_edit_success and post_edit_active and not live_cfg),
+                    "post_edit_profile_requested": post_edit_active if post_edit_active and not live_cfg else "",
                     "post_edit_profile": post_edit_active if post_edit_success and post_edit_active and not live_cfg else "",
                 })
                 cls = focused_class()
@@ -3560,6 +4174,7 @@ def run_session(
                         "paste_right_click": "Pasting (right click)",
                     }.get(insert_mode, "Typing")
                     print(f"[TYPE] {action} {len(result)} chars into {cls!r}", flush=True)
+                    _wait_for_hotkey_release_before_insert(hotkey_name, config)
                     _last_typed[0] = ""
                     if insert_mode in {"paste_ctrl_v", "paste_right_click"}:
                         paste_text(result, method=insert_mode, source=f"{profile}_result")
@@ -3649,6 +4264,12 @@ def run_session(
                 _set_overlay(_OVL_IDLE)
                 return
 
+            audio_seconds = (
+                _audio_duration_seconds(raw_full_audio, native_sr)
+                or _audio_duration_seconds(full_audio, config.get("sample_rate", 16000))
+            )
+            transcription_started = time.perf_counter()
+
             # Collect pending chunks that finished just after hotkey release
             still_pending: list = []
             for idx, (holder, ev) in enumerate(pending):
@@ -3698,10 +4319,15 @@ def run_session(
 
             # ── Type remaining chunks (post-release) ─────────────────────
             all_chunk_texts.extend(more_texts)
+            transcription_seconds = time.perf_counter() - transcription_started
             full_result = _join_chunks(all_chunk_texts) if all_chunk_texts else None
+            skip_reason = _final_transcription_skip_reason(full_result)
+            if skip_reason:
+                print(f"[TYPE] Skipping final transcription: {skip_reason}.", flush=True)
+                full_result = None
             error       = more_errors[0] if more_errors and not all_chunk_texts else None
 
-            if more_texts and focused:
+            if full_result and more_texts and focused:
                 if field_content and not full_result.startswith(field_content):
                     delete_chars(1)
                     field_content = field_content[:-1]
@@ -3716,6 +4342,12 @@ def run_session(
                     "time": _now_str(),
                     "text": full_result,
                     "editor_notes": "",
+                    "audio_seconds": round(audio_seconds, 3) if audio_seconds is not None else None,
+                    "transcription_seconds": round(transcription_seconds, 3),
+                    "transcription_rtf": round(_rtf(transcription_seconds, audio_seconds), 4) if _rtf(transcription_seconds, audio_seconds) is not None else None,
+                    "post_edit_enabled": False,
+                    "post_edit_seconds": None,
+                    "post_edit_success": None,
                     "post_edit_active": False,
                 })
                 if not focused:
@@ -3828,12 +4460,14 @@ def open_settings(config: dict, on_save_callback):
 
     MIC = tk.Frame(nb, padx=10, pady=8)  # Microphone tab
     S  = tk.Frame(nb, padx=10, pady=8)   # Advanced tab
-    LLM = tk.Frame(nb, padx=10, pady=8)  # LLM tab
+    TRANS = tk.Frame(nb, padx=10, pady=8) # Transcription AI tab
+    POST = tk.Frame(nb, padx=10, pady=8)  # Post-edit tab
     MT = tk.Frame(nb, padx=10, pady=8)   # Microphone Test tab
     IC = tk.Frame(nb, padx=10, pady=8)   # Input Classes tab
     nb.add(MIC, text="  Microphone  ")
     nb.add(S,  text="  Advanced  ")
-    nb.add(LLM, text="  LLM  ")
+    nb.add(TRANS, text="  Transcription AI  ")
+    nb.add(POST, text="  Post-Edit  ")
     nb.add(MT, text="  Microphone Test  ")
     nb.add(IC, text="  Input Classes  ")
 
@@ -3858,22 +4492,59 @@ def open_settings(config: dict, on_save_callback):
     S.columnconfigure(1, weight=1)
 
     tk.Label(S, text="Backend:").grid(row=0, column=0, sticky="e", **pad)
+    initial_backend = _normalize_transcription_backend(
+        config.get("transcription_backend", DEFAULT_CONFIG["transcription_backend"])
+    )
     transcription_backend_var = tk.StringVar(
         master=win,
-        value=config.get("transcription_backend", DEFAULT_CONFIG["transcription_backend"]),
+        value=initial_backend,
     )
     ttk.Combobox(
         S,
         textvariable=transcription_backend_var,
-        values=("http", "openai"),
+        values=("http", "whispercpp", "openai"),
         width=18,
         state="readonly",
     ).grid(row=0, column=1, sticky="w", **pad)
 
-    tk.Label(S, text="Server URL:").grid(row=1, column=0, sticky="e", **pad)
-    url_var = tk.StringVar(master=win, value=config["server_url"])
+    backend_urls = {
+        "http": (config.get("server_url") or DEFAULT_CONFIG["server_url"]).strip(),
+        "whispercpp": (config.get("whisper_cpp_url") or DEFAULT_CONFIG["whisper_cpp_url"]).strip(),
+    }
+    current_url_backend = [initial_backend if initial_backend in backend_urls else "http"]
+    updating_url = [False]
+
+    url_label = tk.Label(S, text="Server URL:")
+    url_label.grid(row=1, column=0, sticky="e", **pad)
+    url_var = tk.StringVar(master=win, value=backend_urls[current_url_backend[0]])
     url_entry = tk.Entry(S, textvariable=url_var, width=46)
     url_entry.grid(row=1, column=1, columnspan=2, sticky="ew", **pad)
+
+    def _store_backend_url():
+        key = current_url_backend[0]
+        if key in backend_urls:
+            backend_urls[key] = url_var.get().strip()
+
+    def _sync_backend_url(*_):
+        if not updating_url[0]:
+            _store_backend_url()
+
+    def _on_backend_changed(*_):
+        _store_backend_url()
+        backend = _normalize_transcription_backend(transcription_backend_var.get())
+        current_url_backend[0] = backend if backend in backend_urls else "http"
+        label = "Whisper.cpp URL:" if backend == "whispercpp" else "Server URL:"
+        url_label.config(text=label)
+        updating_url[0] = True
+        try:
+            url_var.set(backend_urls.get(current_url_backend[0], ""))
+        finally:
+            updating_url[0] = False
+        url_entry.config(state="disabled" if backend == "openai" else "normal")
+
+    url_var.trace_add("write", _sync_backend_url)
+    transcription_backend_var.trace_add("write", _on_backend_changed)
+    _on_backend_changed()
 
     # Hotkey
     tk.Label(S, text="Hotkey:").grid(row=2, column=0, sticky="e", **pad)
@@ -4106,7 +4777,7 @@ def open_settings(config: dict, on_save_callback):
 
     main_post_edit_cb = tk.Checkbutton(
         normal_mode_frame,
-        text="Start with post-edit enabled — send the final transcript through the LLM before insertion; you can toggle it during dictation with the key set in the LLM tab",
+        text="Start with post-edit enabled — send the final transcript through the post-edit provider before insertion; you can toggle it during dictation with the key set in the Post-Edit tab",
         variable=main_post_edit_var,
         anchor="w",
         justify="left",
@@ -4162,7 +4833,7 @@ def open_settings(config: dict, on_save_callback):
 
     fast_post_edit_cb = tk.Checkbutton(
         fast_mode_frame,
-        text="Start with post-edit enabled — send the final transcript through the LLM before insertion; you can toggle it during dictation with the key set in the LLM tab",
+        text="Start with post-edit enabled — send the final transcript through the post-edit provider before insertion; you can toggle it during dictation with the key set in the Post-Edit tab",
         variable=fast_post_edit_var,
         anchor="w",
         justify="left",
@@ -4248,48 +4919,8 @@ def open_settings(config: dict, on_save_callback):
     _update_duck_audio_state()
 
     # ════════════════════════════════════════════════════════════════════════
-    # LLM tab
+    # Shared multiline text helper
     # ════════════════════════════════════════════════════════════════════════
-    LLM.columnconfigure(1, weight=1)
-
-    tk.Label(
-        LLM,
-        text="Configure optional OpenAI post-editing for classic-mode transcriptions. "
-            "The API key is read from the OPENAI_API_KEY environment variable, not from config.json. "
-             "The OpenAI transcription backend can also use its own cleanup-oriented prompt file. "
-             "Use {transcript} in the user prompt template for the current transcript. "
-             "The post-edit toggle key cycles per-session profiles: off, dev, pro, personal, then off again. "
-             "Each profile uses its own markdown prompt file named <profile>_post_edit_prompt.md. "
-             "Keep project-specific vocabulary in local prompt or context files.",
-        fg="grey",
-        justify="left",
-        wraplength=520,
-    ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
-
-    tk.Label(LLM, text="Post-edit provider:").grid(row=1, column=0, sticky="e", **pad)
-    post_edit_provider_var = tk.StringVar(
-        master=win,
-        value=config.get("post_edit_provider", DEFAULT_CONFIG["post_edit_provider"]),
-    )
-    ttk.Combobox(
-        LLM,
-        textvariable=post_edit_provider_var,
-        values=("openai", "external"),
-        width=12,
-        state="readonly",
-    ).grid(row=1, column=1, sticky="w", **pad)
-
-    tk.Label(LLM, text="External URL:").grid(row=2, column=0, sticky="e", **pad)
-    external_post_edit_url_var = tk.StringVar(
-        master=win,
-        value=config.get("external_post_edit_url", DEFAULT_CONFIG["external_post_edit_url"]),
-    )
-    tk.Entry(LLM, textvariable=external_post_edit_url_var, width=62).grid(row=2, column=1, sticky="ew", **pad)
-
-    tk.Label(LLM, text="API key env:").grid(row=3, column=0, sticky="e", **pad)
-    api_key_status = "set" if _openai_api_key() else "not set"
-    tk.Label(LLM, text=f"OPENAI_API_KEY ({api_key_status})", anchor="w").grid(row=3, column=1, sticky="w", **pad)
-
     def _make_scrolled_text(parent, row: int, height: int):
         frame = tk.Frame(parent)
         frame.grid(row=row, column=1, sticky="nsew", **pad)
@@ -4302,96 +4933,295 @@ def open_settings(config: dict, on_save_callback):
         yscroll.grid(row=0, column=1, sticky="ns")
         return text_widget
 
-    tk.Label(LLM, text="Model:").grid(row=4, column=0, sticky="e", **pad)
-    openai_model_var = tk.StringVar(master=win, value=config.get("openai_model", DEFAULT_CONFIG["openai_model"]))
-    tk.Entry(LLM, textvariable=openai_model_var, width=28).grid(row=4, column=1, sticky="w", **pad)
+    # Transcription AI tab
+    TRANS.columnconfigure(1, weight=1)
 
-    tk.Label(LLM, text="Reasoning effort:").grid(row=5, column=0, sticky="e", **pad)
-    reasoning_var = tk.StringVar(master=win, value=config.get("openai_reasoning_effort", DEFAULT_CONFIG["openai_reasoning_effort"]))
-    ttk.Combobox(
-        LLM,
-        textvariable=reasoning_var,
-        values=("minimal", "low", "medium", "high"),
-        width=12,
-        state="readonly",
-    ).grid(row=5, column=1, sticky="w", **pad)
+    tk.Label(
+        TRANS,
+        text="Settings here are used only when Advanced -> Backend is set to openai. "
+             "Local HTTP and whisper.cpp transcription do not use this model or prompt.",
+        fg="grey",
+        justify="left",
+        wraplength=520,
+    ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
 
-    tk.Label(LLM, text="Transcribe model:").grid(row=6, column=0, sticky="e", **pad)
+    tk.Label(TRANS, text="Transcribe model:").grid(row=1, column=0, sticky="e", **pad)
     openai_transcription_model_var = tk.StringVar(
         master=win,
         value=config.get("openai_transcription_model", DEFAULT_CONFIG["openai_transcription_model"]),
     )
-    tk.Entry(LLM, textvariable=openai_transcription_model_var, width=28).grid(row=6, column=1, sticky="w", **pad)
+    tk.Entry(TRANS, textvariable=openai_transcription_model_var, width=28).grid(row=1, column=1, sticky="w", **pad)
 
-    tk.Label(LLM, text="Transcribe prompt:").grid(row=7, column=0, sticky="ne", **pad)
-    openai_transcription_prompt_text = _make_scrolled_text(LLM, row=7, height=4)
+    tk.Label(TRANS, text="Transcribe prompt:").grid(row=2, column=0, sticky="ne", **pad)
+    openai_transcription_prompt_text = _make_scrolled_text(TRANS, row=2, height=8)
     openai_transcription_prompt_text.insert(
         "1.0",
         config.get("openai_transcription_prompt", DEFAULT_CONFIG["openai_transcription_prompt"]),
     )
-    tk.Label(LLM, text="Transcribe prompt file:").grid(row=8, column=0, sticky="ne", **pad)
+    tk.Label(TRANS, text="Prompt file:").grid(row=3, column=0, sticky="ne", **pad)
     tk.Label(
-        LLM,
+        TRANS,
         text=str(_transcription_prompt_markdown_path(config)),
         anchor="w",
         justify="left",
         wraplength=520,
         fg="grey",
-    ).grid(row=8, column=1, sticky="w", **pad)
+    ).grid(row=3, column=1, sticky="w", **pad)
 
-    tk.Label(LLM, text="Notes base secs:").grid(row=9, column=0, sticky="e", **pad)
+    # Post-edit tab
+    POST.columnconfigure(1, weight=1)
+
+    tk.Label(
+        POST,
+        text="Configure optional post-editing after transcription. "
+             "Hosted OpenAI uses OPENAI_API_KEY. OpenAI-compatible local servers do not need a key unless you configure one. "
+             "Use {transcript} in the user prompt template for the current transcript. "
+             "The toggle key cycles per-session profiles: off, dev, pro, personal, then off again.",
+        fg="grey",
+        justify="left",
+        wraplength=520,
+    ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+
+    tk.Label(POST, text="Post-edit provider:").grid(row=1, column=0, sticky="e", **pad)
+    post_edit_provider_var = tk.StringVar(
+        master=win,
+        value=_normalize_post_edit_provider(config.get("post_edit_provider", DEFAULT_CONFIG["post_edit_provider"])),
+    )
+    ttk.Combobox(
+        POST,
+        textvariable=post_edit_provider_var,
+        values=("openai", "openai_compatible", "external"),
+        width=20,
+        state="readonly",
+    ).grid(row=1, column=1, sticky="w", **pad)
+
+    tk.Label(POST, text="External URL:").grid(row=2, column=0, sticky="e", **pad)
+    external_post_edit_url_var = tk.StringVar(
+        master=win,
+        value=config.get("external_post_edit_url", DEFAULT_CONFIG["external_post_edit_url"]),
+    )
+    tk.Entry(POST, textvariable=external_post_edit_url_var, width=62).grid(row=2, column=1, sticky="ew", **pad)
+
+    tk.Label(POST, text="Compat URL:").grid(row=3, column=0, sticky="e", **pad)
+    openai_compatible_post_edit_url_var = tk.StringVar(
+        master=win,
+        value=config.get(
+            "openai_compatible_post_edit_url",
+            DEFAULT_CONFIG["openai_compatible_post_edit_url"],
+        ),
+    )
+    tk.Entry(POST, textvariable=openai_compatible_post_edit_url_var, width=62).grid(row=3, column=1, sticky="ew", **pad)
+
+    tk.Label(POST, text="Model:").grid(row=4, column=0, sticky="e", **pad)
+    initial_post_edit_provider = _normalize_post_edit_provider(post_edit_provider_var.get())
+    post_edit_model_var = tk.StringVar(
+        master=win,
+        value=config.get(
+            _post_edit_provider_model_key(initial_post_edit_provider),
+            DEFAULT_CONFIG.get(_post_edit_provider_model_key(initial_post_edit_provider), ""),
+        ),
+    )
+    post_edit_model_frame = tk.Frame(POST)
+    post_edit_model_frame.grid(row=4, column=1, sticky="ew", **pad)
+    post_edit_model_frame.columnconfigure(0, weight=1)
+    post_edit_model_combo = ttk.Combobox(
+        post_edit_model_frame,
+        textvariable=post_edit_model_var,
+        values=(),
+        width=34,
+        state="normal",
+    )
+    post_edit_model_combo.grid(row=0, column=0, sticky="w")
+    compat_model_status_var = tk.StringVar(master=win, value="")
+    compat_refresh_btn = tk.Button(post_edit_model_frame, text="Refresh", width=8)
+    compat_refresh_btn.grid(row=0, column=1, sticky="w", padx=(6, 0))
+    tk.Label(
+        post_edit_model_frame,
+        textvariable=compat_model_status_var,
+        fg="grey",
+        anchor="w",
+    ).grid(row=0, column=2, sticky="w", padx=(8, 0))
+    compatible_model_options = [[]]
+    profile_model_combo_ref = [None]
+
+    def _refresh_compatible_models(auto: bool = False):
+        url = openai_compatible_post_edit_url_var.get().strip()
+        if not url:
+            compat_model_status_var.set("no URL")
+            return
+        compat_model_status_var.set("loading models...")
+        compat_refresh_btn.config(state="disabled")
+
+        def _load():
+            try:
+                headers = {}
+                api_key = _openai_compatible_api_key({
+                    **config,
+                    "openai_compatible_post_edit_api_key_env": config.get("openai_compatible_post_edit_api_key_env", ""),
+                })
+                if api_key:
+                    headers["Authorization"] = f"Bearer {api_key}"
+                models = _fetch_openai_compatible_models(url, headers=headers, timeout=10)
+                if not models:
+                    raise RuntimeError("no models returned")
+
+                def _apply():
+                    compatible_model_options[0] = models
+                    if active_post_edit_provider[0] == "openai_compatible":
+                        post_edit_model_combo.configure(values=models)
+                        if profile_model_combo_ref[0] is not None:
+                            profile_model_combo_ref[0].configure(values=models)
+                        current = post_edit_model_var.get().strip()
+                        selected = _preferred_openai_compatible_model(models, current)
+                        if selected and selected != current and (auto or current in {"", DEFAULT_CONFIG["openai_compatible_post_edit_model"]}):
+                            post_edit_model_var.set(selected)
+                        compat_model_status_var.set(f"{len(models)} models")
+                        compat_refresh_btn.config(state="normal")
+
+                win.after(0, _apply)
+            except Exception as exc:
+                error_text = str(exc)
+                def _fail():
+                    if active_post_edit_provider[0] == "openai_compatible":
+                        compat_model_status_var.set(f"model fetch failed: {error_text}")
+                        compat_refresh_btn.config(state="normal")
+
+                win.after(0, _fail)
+
+        threading.Thread(target=_load, daemon=True).start()
+
+    compat_refresh_btn.config(command=lambda: _refresh_compatible_models(auto=False))
+    if initial_post_edit_provider == "openai_compatible":
+        win.after(350, lambda: _refresh_compatible_models(auto=True))
+
+    tk.Label(POST, text="Compat temp:").grid(row=5, column=0, sticky="e", **pad)
+    openai_compatible_post_edit_temperature_var = tk.StringVar(
+        master=win,
+        value=str(config.get(
+            "openai_compatible_post_edit_temperature",
+            DEFAULT_CONFIG["openai_compatible_post_edit_temperature"],
+        )),
+    )
+    tk.Entry(POST, textvariable=openai_compatible_post_edit_temperature_var, width=8).grid(row=5, column=1, sticky="w", **pad)
+
+    tk.Label(POST, text="API key env:").grid(row=6, column=0, sticky="e", **pad)
+    api_key_status = "set" if _openai_api_key() else "not set"
+    compatible_key_env = (config.get("openai_compatible_post_edit_api_key_env") or "").strip()
+    compatible_key_status = (
+        f"{compatible_key_env} set" if _openai_compatible_api_key(config)
+        else f"{compatible_key_env} not set" if compatible_key_env
+        else "OpenAI-compatible optional/off"
+    )
+    tk.Label(
+        POST,
+        text=f"OPENAI_API_KEY ({api_key_status}); {compatible_key_status}",
+        anchor="w",
+    ).grid(row=6, column=1, sticky="w", **pad)
+
+    tk.Label(POST, text="Reasoning effort:").grid(row=7, column=0, sticky="e", **pad)
+    reasoning_var = tk.StringVar(master=win, value=config.get("openai_reasoning_effort", DEFAULT_CONFIG["openai_reasoning_effort"]))
+    ttk.Combobox(
+        POST,
+        textvariable=reasoning_var,
+        values=("minimal", "low", "medium", "high"),
+        width=12,
+        state="readonly",
+    ).grid(row=7, column=1, sticky="w", **pad)
+
+    tk.Label(POST, text="Notes base secs:").grid(row=8, column=0, sticky="e", **pad)
     editor_notes_overlay_var = tk.StringVar(
         master=win,
         value=str(config.get("editor_notes_overlay_seconds", DEFAULT_CONFIG["editor_notes_overlay_seconds"])),
     )
-    tk.Entry(LLM, textvariable=editor_notes_overlay_var, width=8).grid(row=9, column=1, sticky="w", **pad)
+    tk.Entry(POST, textvariable=editor_notes_overlay_var, width=8).grid(row=8, column=1, sticky="w", **pad)
 
-    tk.Label(LLM, text="Chars / extra sec:").grid(row=10, column=0, sticky="e", **pad)
+    tk.Label(POST, text="Chars / extra sec:").grid(row=9, column=0, sticky="e", **pad)
     editor_notes_scale_var = tk.StringVar(
         master=win,
         value=str(config.get("editor_notes_chars_per_extra_second", DEFAULT_CONFIG["editor_notes_chars_per_extra_second"])),
     )
-    tk.Entry(LLM, textvariable=editor_notes_scale_var, width=8).grid(row=10, column=1, sticky="w", **pad)
+    tk.Entry(POST, textvariable=editor_notes_scale_var, width=8).grid(row=9, column=1, sticky="w", **pad)
 
-    tk.Label(LLM, text="Toggle key:").grid(row=11, column=0, sticky="e", **pad)
+    tk.Label(POST, text="Toggle key:").grid(row=10, column=0, sticky="e", **pad)
     post_edit_toggle_key_var = tk.StringVar(
         master=win,
         value=config.get("post_edit_toggle_key", DEFAULT_CONFIG["post_edit_toggle_key"]),
     )
-    tk.Entry(LLM, textvariable=post_edit_toggle_key_var, width=8).grid(row=11, column=1, sticky="w", **pad)
+    tk.Entry(POST, textvariable=post_edit_toggle_key_var, width=8).grid(row=10, column=1, sticky="w", **pad)
 
-    tk.Label(LLM, text="Post-edit profile:").grid(row=12, column=0, sticky="e", **pad)
+    post_edit_auto_insert_var = tk.BooleanVar(
+        master=win,
+        value=bool(config.get("post_edit_preview_auto_insert", DEFAULT_CONFIG["post_edit_preview_auto_insert"])),
+    )
+    tk.Checkbutton(
+        POST,
+        text="Auto-insert edited preview results when post-edit succeeds",
+        variable=post_edit_auto_insert_var,
+        anchor="w",
+        justify="left",
+        wraplength=520,
+    ).grid(row=11, column=0, columnspan=2, sticky="w", **pad)
+
+    review_copy_include_notes_var = tk.BooleanVar(
+        master=win,
+        value=bool(config.get(
+            "post_edit_review_copy_includes_notes",
+            DEFAULT_CONFIG["post_edit_review_copy_includes_notes"],
+        )),
+    )
+    tk.Checkbutton(
+        POST,
+        text="Review window Copy includes editor notes by default",
+        variable=review_copy_include_notes_var,
+        anchor="w",
+        justify="left",
+        wraplength=520,
+    ).grid(row=12, column=0, columnspan=2, sticky="w", **pad)
+
+    tk.Label(POST, text="Post-edit profile:").grid(row=13, column=0, sticky="e", **pad)
     prompt_profile_var = tk.StringVar(master=win, value=POST_EDIT_PROFILES[0])
     prompt_profile_combo = ttk.Combobox(
-        LLM,
+        POST,
         textvariable=prompt_profile_var,
         values=POST_EDIT_PROFILES,
         width=12,
         state="readonly",
     )
-    prompt_profile_combo.grid(row=12, column=1, sticky="w", **pad)
+    prompt_profile_combo.grid(row=13, column=1, sticky="w", **pad)
 
-    tk.Label(LLM, text="Profile prompt file:").grid(row=13, column=0, sticky="ne", **pad)
+    tk.Label(POST, text="Profile model:").grid(row=14, column=0, sticky="e", **pad)
+    profile_model_var = tk.StringVar(master=win, value="")
+    profile_model_combo = ttk.Combobox(
+        POST,
+        textvariable=profile_model_var,
+        values=(),
+        width=34,
+        state="normal",
+    )
+    profile_model_combo.grid(row=14, column=1, sticky="w", **pad)
+    profile_model_combo_ref[0] = profile_model_combo
+
+    tk.Label(POST, text="Profile prompt file:").grid(row=15, column=0, sticky="ne", **pad)
     prompt_profile_path_var = tk.StringVar(master=win, value=str(_prompt_markdown_path(config, POST_EDIT_PROFILES[0])))
     tk.Label(
-        LLM,
+        POST,
         textvariable=prompt_profile_path_var,
         anchor="w",
         justify="left",
         wraplength=520,
         fg="grey",
-    ).grid(row=13, column=1, sticky="w", **pad)
+    ).grid(row=15, column=1, sticky="w", **pad)
 
-    tk.Label(LLM, text="System prompt:").grid(row=14, column=0, sticky="ne", **pad)
-    system_prompt_text = _make_scrolled_text(LLM, row=14, height=4)
+    tk.Label(POST, text="System prompt:").grid(row=16, column=0, sticky="ne", **pad)
+    system_prompt_text = _make_scrolled_text(POST, row=16, height=4)
     system_prompt_text.insert("1.0", config.get("openai_system_prompt", DEFAULT_CONFIG["openai_system_prompt"]))
 
-    tk.Label(LLM, text="Developer prompt:").grid(row=15, column=0, sticky="ne", **pad)
-    developer_prompt_text = _make_scrolled_text(LLM, row=15, height=6)
+    tk.Label(POST, text="Developer prompt:").grid(row=17, column=0, sticky="ne", **pad)
+    developer_prompt_text = _make_scrolled_text(POST, row=17, height=6)
     developer_prompt_text.insert("1.0", config.get("openai_developer_prompt", DEFAULT_CONFIG["openai_developer_prompt"]))
 
-    tk.Label(LLM, text="User prompt template:").grid(row=16, column=0, sticky="ne", **pad)
-    user_prompt_text = _make_scrolled_text(LLM, row=16, height=8)
+    tk.Label(POST, text="User prompt template:").grid(row=18, column=0, sticky="ne", **pad)
+    user_prompt_text = _make_scrolled_text(POST, row=18, height=8)
     user_prompt_text.insert("1.0", config.get("openai_user_prompt_template", DEFAULT_CONFIG["openai_user_prompt_template"]))
 
     prompt_sections_by_profile = {
@@ -4399,6 +5229,20 @@ def open_settings(config: dict, on_save_callback):
         for profile in POST_EDIT_PROFILES
     }
     active_prompt_profile = [POST_EDIT_PROFILES[0]]
+    post_edit_providers = ("openai", "openai_compatible", "external")
+    active_post_edit_provider = [initial_post_edit_provider]
+    post_edit_model_values = {
+        provider: (
+            config.get(_post_edit_provider_model_key(provider))
+            or DEFAULT_CONFIG.get(_post_edit_provider_model_key(provider), "")
+        ).strip()
+        for provider in post_edit_providers
+    }
+    profile_model_values = {
+        (provider, profile): (config.get(_post_edit_profile_model_key(provider, profile)) or "").strip()
+        for provider in post_edit_providers
+        for profile in POST_EDIT_PROFILES
+    }
 
     def _prompt_fields_to_sections() -> dict[str, str]:
         return {
@@ -4407,7 +5251,37 @@ def open_settings(config: dict, on_save_callback):
             "user": user_prompt_text.get("1.0", "end").strip(),
         }
 
+    def _configure_model_controls():
+        provider = active_post_edit_provider[0]
+        if provider == "openai_compatible":
+            values = tuple(compatible_model_options[0])
+            post_edit_model_combo.configure(values=values)
+            profile_model_combo.configure(values=values)
+            compat_refresh_btn.config(state="normal")
+            compat_model_status_var.set(
+                f"{len(values)} models" if values else "refresh models"
+            )
+        else:
+            post_edit_model_combo.configure(values=())
+            profile_model_combo.configure(values=())
+            compat_refresh_btn.config(state="disabled")
+            compat_model_status_var.set("manual model")
+
+    def _store_active_model_values():
+        provider = active_post_edit_provider[0]
+        profile = active_prompt_profile[0]
+        post_edit_model_values[provider] = post_edit_model_var.get().strip()
+        profile_model_values[(provider, profile)] = profile_model_var.get().strip()
+
+    def _load_active_model_values():
+        provider = active_post_edit_provider[0]
+        profile = active_prompt_profile[0]
+        post_edit_model_var.set(post_edit_model_values.get(provider, ""))
+        profile_model_var.set(profile_model_values.get((provider, profile), ""))
+        _configure_model_controls()
+
     def _store_active_prompt_profile():
+        _store_active_model_values()
         prompt_sections_by_profile[active_prompt_profile[0]] = _prompt_fields_to_sections()
 
     def _load_prompt_profile(profile: str):
@@ -4422,13 +5296,23 @@ def open_settings(config: dict, on_save_callback):
             widget.insert("1.0", sections.get(key, ""))
         prompt_profile_path_var.set(str(_prompt_markdown_path(config, profile)))
         active_prompt_profile[0] = profile
+        _load_active_model_values()
 
     def _on_prompt_profile_changed(_event=None):
         _store_active_prompt_profile()
         _load_prompt_profile(prompt_profile_var.get())
 
+    def _on_post_edit_provider_changed(*_):
+        _store_active_model_values()
+        active_post_edit_provider[0] = _normalize_post_edit_provider(post_edit_provider_var.get())
+        _load_active_model_values()
+        if active_post_edit_provider[0] == "openai_compatible" and not compatible_model_options[0]:
+            win.after(50, lambda: _refresh_compatible_models(auto=True))
+
     prompt_profile_combo.bind("<<ComboboxSelected>>", _on_prompt_profile_changed)
     _load_prompt_profile(POST_EDIT_PROFILES[0])
+    post_edit_provider_var.trace_add("write", _on_post_edit_provider_changed)
+    _configure_model_controls()
 
     # ════════════════════════════════════════════════════════════════════════
     # Microphone Test tab
@@ -4841,6 +5725,7 @@ def open_settings(config: dict, on_save_callback):
             row_f.columnconfigure(0, weight=1)
 
             ts_str = entry.get("time", "")
+            status_line = _history_status_line(entry)
             text_value = (entry.get("text") or "").strip()
             error_value = (entry.get("error") or "").strip()
 
@@ -4856,7 +5741,8 @@ def open_settings(config: dict, on_save_callback):
                 retry_btn = tk.Button(row_f, text="Retry", width=6)
                 retry_btn.grid(row=0, column=1, padx=(6, 0))
 
-                tk.Label(row_f, text=f"{ts_str}  |  {wav_name}", fg="grey",
+                failed_status = f"{status_line}  |  {wav_name}" if status_line else wav_name
+                tk.Label(row_f, text=failed_status, fg="grey", anchor="w", justify="left", wraplength=400,
                          font=("Segoe UI", 8)).grid(row=1, column=0, sticky="w", padx=2)
 
                 def _make_retry(e, btn):
@@ -4891,12 +5777,12 @@ def open_settings(config: dict, on_save_callback):
 
                 tk.Button(row_f, text="Copy", command=_make_copy(text_value),
                           width=6).grid(row=0, column=1, padx=(6, 0))
-                tk.Label(row_f, text=ts_str, fg="grey",
+                tk.Label(row_f, text=status_line or ts_str, fg="grey", anchor="w", justify="left", wraplength=400,
                          font=("Segoe UI", 8)).grid(row=1, column=0, sticky="w", padx=2)
             else:
                 tk.Label(row_f, text=error_value or "(empty history entry)", anchor="w", justify="left",
                          fg="#6b7280", font=("Segoe UI", 9), wraplength=400).grid(row=0, column=0, sticky="ew")
-                tk.Label(row_f, text=ts_str, fg="grey",
+                tk.Label(row_f, text=status_line or ts_str, fg="grey", anchor="w", justify="left", wraplength=400,
                          font=("Segoe UI", 8)).grid(row=1, column=0, sticky="w", padx=2)
 
     _build_history()
@@ -4908,9 +5794,11 @@ def open_settings(config: dict, on_save_callback):
     def on_save():
         _add_class()
         _mon_active[0] = False
+        _store_backend_url()
         new_cfg = dict(config)
-        new_cfg["transcription_backend"] = transcription_backend_var.get().strip() or DEFAULT_CONFIG["transcription_backend"]
-        new_cfg["server_url"] = url_var.get().strip()
+        new_cfg["transcription_backend"] = _normalize_transcription_backend(transcription_backend_var.get())
+        new_cfg["server_url"] = backend_urls["http"].strip()
+        new_cfg["whisper_cpp_url"] = backend_urls["whispercpp"].strip()
         new_cfg["language"]   = lang_var.get().strip() or None
         sel = mic_var.get()
         new_cfg["microphone_index"] = (
@@ -4918,6 +5806,9 @@ def open_settings(config: dict, on_save_callback):
         )
         if new_cfg["transcription_backend"] == "http" and not new_cfg["server_url"]:
             messagebox.showerror("Error", "Server URL cannot be empty.")
+            return
+        if new_cfg["transcription_backend"] == "whispercpp" and not new_cfg["whisper_cpp_url"]:
+            messagebox.showerror("Error", "Whisper.cpp URL cannot be empty.")
             return
         hotkey = hotkey_var.get().strip()
         ok, msg = validate_hotkey(hotkey)
@@ -4980,11 +5871,32 @@ def open_settings(config: dict, on_save_callback):
             new_cfg["duck_audio_level_percent"] = max(0, min(100, int(duck_audio_level_var.get().strip() or DEFAULT_CONFIG["duck_audio_level_percent"])))
         except Exception:
             new_cfg["duck_audio_level_percent"] = DEFAULT_CONFIG["duck_audio_level_percent"]
-        new_cfg["post_edit_provider"] = post_edit_provider_var.get().strip().lower() or DEFAULT_CONFIG["post_edit_provider"]
+        new_cfg["post_edit_provider"] = _normalize_post_edit_provider(post_edit_provider_var.get())
         new_cfg["external_post_edit_url"] = (
             external_post_edit_url_var.get().strip() or DEFAULT_CONFIG["external_post_edit_url"]
         )
-        new_cfg["openai_model"] = openai_model_var.get().strip() or DEFAULT_CONFIG["openai_model"]
+        new_cfg["openai_compatible_post_edit_url"] = (
+            openai_compatible_post_edit_url_var.get().strip()
+            or DEFAULT_CONFIG["openai_compatible_post_edit_url"]
+        )
+        _store_active_model_values()
+        for provider in post_edit_providers:
+            model_key = _post_edit_provider_model_key(provider)
+            new_cfg[model_key] = (
+                post_edit_model_values.get(provider, "").strip()
+                or DEFAULT_CONFIG.get(model_key, "")
+            )
+            for prompt_profile in POST_EDIT_PROFILES:
+                profile_model_key = _post_edit_profile_model_key(provider, prompt_profile)
+                new_cfg[profile_model_key] = profile_model_values.get((provider, prompt_profile), "").strip()
+        try:
+            new_cfg["openai_compatible_post_edit_temperature"] = float(
+                openai_compatible_post_edit_temperature_var.get().strip()
+                or DEFAULT_CONFIG["openai_compatible_post_edit_temperature"]
+            )
+        except Exception:
+            messagebox.showerror("Invalid OpenAI-compatible value", "Compatible temp must be a number.")
+            return
         new_cfg["openai_transcription_model"] = (
             openai_transcription_model_var.get().strip() or DEFAULT_CONFIG["openai_transcription_model"]
         )
@@ -5001,6 +5913,8 @@ def open_settings(config: dict, on_save_callback):
         except Exception:
             new_cfg["editor_notes_chars_per_extra_second"] = DEFAULT_CONFIG["editor_notes_chars_per_extra_second"]
         new_cfg["post_edit_toggle_key"] = post_edit_toggle_key_var.get().strip().lower() or DEFAULT_CONFIG["post_edit_toggle_key"]
+        new_cfg["post_edit_preview_auto_insert"] = bool(post_edit_auto_insert_var.get())
+        new_cfg["post_edit_review_copy_includes_notes"] = bool(review_copy_include_notes_var.get())
         _store_active_prompt_profile()
         for prompt_profile, prompt_sections in prompt_sections_by_profile.items():
             _save_prompt_markdown(new_cfg, prompt_profile, prompt_sections)
@@ -5383,9 +6297,12 @@ def main():
     _current_config[0] = cfg
 
     print("OverMultiASRSuite", flush=True)
-    print(f"  Backend: {cfg.get('transcription_backend', DEFAULT_CONFIG['transcription_backend'])}", flush=True)
-    if (cfg.get("transcription_backend") or DEFAULT_CONFIG["transcription_backend"]) == "openai":
+    backend = _normalize_transcription_backend(cfg.get("transcription_backend"))
+    print(f"  Backend: {backend}", flush=True)
+    if backend == "openai":
         print(f"  Model  : {cfg.get('openai_transcription_model', DEFAULT_CONFIG['openai_transcription_model'])}", flush=True)
+    elif backend == "whispercpp":
+        print(f"  Server : {cfg.get('whisper_cpp_url', DEFAULT_CONFIG['whisper_cpp_url'])}", flush=True)
     else:
         print(f"  Server : {cfg['server_url']}", flush=True)
     print(f"  Hotkey : {cfg['hotkey']}", flush=True)
