@@ -166,6 +166,7 @@ DEFAULT_CONFIG = {
     "simple_mode": True,   # True = simple ® / ¿ indicators (SSH/terminal safe); False = fancy block-shade/corner-spin animations  (classic mode only)
     "vad_silence_rms":  400,   # RMS below this = silence. Hangover handles noise, so keep this low.
     "vad_silence_secs": 1.5,   # seconds of silence that triggers a background send
+    "vad_post_edit_silence_secs": 1.5,  # silence seconds while session post-edit is on
     "vad_min_speech_s": 0.5,   # minimum speech seconds before a cut is allowed
     "vad_hangover_s":   0.3,   # stay in "speech" state this long after last loud block
     "vad_max_chunk_s":  30.0,  # force-send a chunk after this many seconds regardless
@@ -1604,9 +1605,11 @@ def _record_with_vad(
     target_sr   = config.get("sample_rate",     16000)
     device      = config.get("microphone_index")
     sil_rms     = config.get("vad_silence_rms",  _VAD_SILENCE_RMS)
-    sil_secs    = config.get("vad_silence_secs", _VAD_SILENCE_SECS)
+    sil_secs_off = float(config.get("vad_silence_secs", _VAD_SILENCE_SECS))
+    sil_secs_post_edit = float(config.get("vad_post_edit_silence_secs", sil_secs_off))
     min_speech  = config.get("vad_min_speech_s", _VAD_MIN_SPEECH_S)
     max_chunk_s = config.get("vad_max_chunk_s",  30.0)
+    post_edit_active = _post_edit_profile_name(post_edit_active)
 
     probe = _probe_recording_backend(config)
     if not probe.get("ok"):
@@ -1622,11 +1625,25 @@ def _record_with_vad(
         print(f"[REC] Device native {native_sr} Hz -> resampling to {target_sr} Hz", flush=True)
 
     SIL_SAMPLES = SPEECH_SAMPLES = MIN_SAMPLES = HANGOVER_SAMPLES = 1
+    active_silence_secs = [None]
+
+    def _selected_silence_secs() -> float:
+        return sil_secs_post_edit if post_edit_active else sil_secs_off
+
+    def _refresh_silence_samples(reason: str = ""):
+        nonlocal SIL_SAMPLES
+        selected = max(0.05, float(_selected_silence_secs()))
+        SIL_SAMPLES = max(1, int(selected * native_sr))
+        if active_silence_secs[0] != selected:
+            active_silence_secs[0] = selected
+            state_label = "post-edit on" if post_edit_active else "post-edit off"
+            detail = f" ({reason})" if reason else ""
+            print(f"[VAD] Silence trigger: {selected:.2f}s while {state_label}{detail}.", flush=True)
 
     def _configure_rate(rate: int):
         nonlocal native_sr, SIL_SAMPLES, SPEECH_SAMPLES, MIN_SAMPLES, HANGOVER_SAMPLES
         native_sr = int(rate)
-        SIL_SAMPLES      = max(1, int(sil_secs * native_sr))
+        _refresh_silence_samples("input rate")
         SPEECH_SAMPLES   = max(1, int(min_speech * native_sr))
         MIN_SAMPLES      = max(1, int(0.3 * native_sr))
         HANGOVER_SAMPLES = max(1, int(config.get("vad_hangover_s", 0.3) * native_sr))
@@ -1672,7 +1689,6 @@ def _record_with_vad(
             default=0.0,
         )
 
-    post_edit_active = _post_edit_profile_name(post_edit_active)
     toggle_y_down = False
     toggle_enabled = on_post_edit_toggle is not None
     toggle_key = (config.get("post_edit_toggle_key") or DEFAULT_CONFIG["post_edit_toggle_key"]).strip().lower()
@@ -1698,6 +1714,7 @@ def _record_with_vad(
                 y_down = False
             if y_down and not toggle_y_down:
                 post_edit_active = _next_post_edit_profile(post_edit_active)
+                _refresh_silence_samples("post-edit toggle")
                 state_label = post_edit_active.upper() if post_edit_active else "OFF"
                 print(
                     f"[POST] Session post-edit profile set to {state_label} via {toggle_key.upper()}.",
@@ -4713,29 +4730,38 @@ def open_settings(config: dict, on_save_callback):
     tk.Label(vad_frame, text="0–32767  raise if pauses are never detected",
              fg="grey").grid(row=0, column=2, sticky="w", **vpad)
 
-    tk.Label(vad_frame, text="Silence secs:").grid(row=1, column=0, sticky="e", **vpad)
+    tk.Label(vad_frame, text="Silence secs (PE off):").grid(row=1, column=0, sticky="e", **vpad)
     vad_secs_var = tk.StringVar(master=win, value=str(config.get("vad_silence_secs", 1.5)))
     tk.Entry(vad_frame, textvariable=vad_secs_var, width=7).grid(row=1, column=1, sticky="w", **vpad)
     tk.Label(vad_frame, text="seconds of silence that fires a background send",
              fg="grey").grid(row=1, column=2, sticky="w", **vpad)
 
-    tk.Label(vad_frame, text="Min speech secs:").grid(row=2, column=0, sticky="e", **vpad)
-    vad_speech_var = tk.StringVar(master=win, value=str(config.get("vad_min_speech_s", 0.5)))
-    tk.Entry(vad_frame, textvariable=vad_speech_var, width=7).grid(row=2, column=1, sticky="w", **vpad)
-    tk.Label(vad_frame, text="minimum speech before a cut is allowed",
+    tk.Label(vad_frame, text="Silence secs (PE on):").grid(row=2, column=0, sticky="e", **vpad)
+    vad_post_edit_secs_var = tk.StringVar(
+        master=win,
+        value=str(config.get("vad_post_edit_silence_secs", config.get("vad_silence_secs", 1.5))),
+    )
+    tk.Entry(vad_frame, textvariable=vad_post_edit_secs_var, width=7).grid(row=2, column=1, sticky="w", **vpad)
+    tk.Label(vad_frame, text="used while any post-edit profile is active",
              fg="grey").grid(row=2, column=2, sticky="w", **vpad)
 
-    tk.Label(vad_frame, text="Hangover secs:").grid(row=3, column=0, sticky="e", **vpad)
-    vad_hang_var = tk.StringVar(master=win, value=str(config.get("vad_hangover_s", 0.3)))
-    tk.Entry(vad_frame, textvariable=vad_hang_var, width=7).grid(row=3, column=1, sticky="w", **vpad)
-    tk.Label(vad_frame, text="stay in speech state this long after last loud block",
+    tk.Label(vad_frame, text="Min speech secs:").grid(row=3, column=0, sticky="e", **vpad)
+    vad_speech_var = tk.StringVar(master=win, value=str(config.get("vad_min_speech_s", 0.5)))
+    tk.Entry(vad_frame, textvariable=vad_speech_var, width=7).grid(row=3, column=1, sticky="w", **vpad)
+    tk.Label(vad_frame, text="minimum speech before a cut is allowed",
              fg="grey").grid(row=3, column=2, sticky="w", **vpad)
 
-    tk.Label(vad_frame, text="Max chunk secs:").grid(row=4, column=0, sticky="e", **vpad)
-    vad_max_var = tk.StringVar(master=win, value=str(config.get("vad_max_chunk_s", 30.0)))
-    tk.Entry(vad_frame, textvariable=vad_max_var, width=7).grid(row=4, column=1, sticky="w", **vpad)
-    tk.Label(vad_frame, text="force-send after this many seconds regardless of silence",
+    tk.Label(vad_frame, text="Hangover secs:").grid(row=4, column=0, sticky="e", **vpad)
+    vad_hang_var = tk.StringVar(master=win, value=str(config.get("vad_hangover_s", 0.3)))
+    tk.Entry(vad_frame, textvariable=vad_hang_var, width=7).grid(row=4, column=1, sticky="w", **vpad)
+    tk.Label(vad_frame, text="stay in speech state this long after last loud block",
              fg="grey").grid(row=4, column=2, sticky="w", **vpad)
+
+    tk.Label(vad_frame, text="Max chunk secs:").grid(row=5, column=0, sticky="e", **vpad)
+    vad_max_var = tk.StringVar(master=win, value=str(config.get("vad_max_chunk_s", 30.0)))
+    tk.Entry(vad_frame, textvariable=vad_max_var, width=7).grid(row=5, column=1, sticky="w", **vpad)
+    tk.Label(vad_frame, text="force-send after this many seconds regardless of silence",
+             fg="grey").grid(row=5, column=2, sticky="w", **vpad)
 
     # ── Mode defaults ─────────────────────────────────────────────────────────
     main_mode_var = tk.StringVar(master=win, value=config.get("main_mode", DEFAULT_CONFIG["main_mode"]))
@@ -5837,6 +5863,7 @@ def open_settings(config: dict, on_save_callback):
         try:
             new_cfg["vad_silence_rms"]  = float(vad_rms_var.get())
             new_cfg["vad_silence_secs"] = float(vad_secs_var.get())
+            new_cfg["vad_post_edit_silence_secs"] = float(vad_post_edit_secs_var.get())
             new_cfg["vad_min_speech_s"] = float(vad_speech_var.get())
             new_cfg["vad_hangover_s"]   = float(vad_hang_var.get())
             new_cfg["vad_max_chunk_s"]  = float(vad_max_var.get())

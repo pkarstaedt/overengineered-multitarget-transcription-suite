@@ -60,6 +60,7 @@
   "preview_max_height": 1000,
   "vad_silence_rms": 400,
   "vad_silence_secs": 1.5,
+  "vad_post_edit_silence_secs": 1.5,
   "vad_min_speech_s": 0.5,
   "vad_hangover_s": 0.3,
   "vad_max_chunk_s": 30.0,
