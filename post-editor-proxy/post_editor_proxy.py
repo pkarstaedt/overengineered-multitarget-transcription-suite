@@ -257,6 +257,69 @@ async def _call_ollama_structured(
     }
 
 
+async def _call_ollama_text(
+    *,
+    messages: list[dict[str, str]],
+    model: str,
+    think: bool | None = None,
+    num_ctx: int | None = None,
+    num_predict: int | None = None,
+    temperature: float | None = None,
+    keep_alive: str | None = None,
+) -> tuple[str, dict[str, Any]]:
+    options = {
+        "temperature": args.temperature if temperature is None else float(temperature),
+        "num_ctx": args.num_ctx if num_ctx is None else int(num_ctx),
+    }
+    if num_predict is not None:
+        options["num_predict"] = max(1, int(num_predict))
+    body = {
+        "model": model,
+        "stream": False,
+        "think": True if think is None else think,
+        "keep_alive": keep_alive or args.keep_alive,
+        "options": options,
+        "messages": messages,
+    }
+
+    started = time.time()
+    try:
+        async with httpx.AsyncClient(timeout=args.ollama_timeout) as client:
+            response = await client.post(f"{args.ollama_url.rstrip('/')}/api/chat", json=body)
+    except httpx.HTTPError as exc:
+        return "", {"status": "failed", "error": f"ollama_unavailable: {exc}"}
+
+    elapsed_ms = round((time.time() - started) * 1000, 3)
+    if response.status_code >= 400:
+        return "", {
+            "status": "failed",
+            "error": f"ollama_failed_http_{response.status_code}",
+            "detail": response.text[:1000],
+            "elapsed_ms": elapsed_ms,
+        }
+
+    try:
+        payload = response.json()
+        answer = _message_text((payload.get("message") or {}).get("content")).strip()
+    except (ValueError, TypeError, json.JSONDecodeError) as exc:
+        return "", {
+            "status": "failed",
+            "error": f"invalid_ollama_response: {exc}",
+            "elapsed_ms": elapsed_ms,
+        }
+    if not answer:
+        return "", {
+            "status": "failed",
+            "error": "empty_answer",
+            "elapsed_ms": elapsed_ms,
+        }
+    return answer, {
+        "status": "completed",
+        "model": model,
+        "elapsed_ms": elapsed_ms,
+    }
+
+
 def _log_result(
     raw_text: str,
     edited_text: str,
@@ -418,7 +481,7 @@ async def transcribe(
 
 @app.post("/external_postedit")
 async def external_postedit(payload: dict[str, Any] = Body(...)):
-    """Run a caller-supplied post-edit prompt through the local Ollama backend."""
+    """Run a caller-supplied post-edit or Voice Ask prompt through Ollama."""
     global last_result
 
     total_started = time.time()
@@ -427,8 +490,37 @@ async def external_postedit(payload: dict[str, Any] = Body(...)):
     if not model:
         raise HTTPException(status_code=400, detail="model is required")
 
-    schema = payload.get("schema") if isinstance(payload.get("schema"), dict) else EDIT_SCHEMA
     options = payload.get("options") if isinstance(payload.get("options"), dict) else {}
+    mode = str(payload.get("mode") or "post_edit").strip().lower()
+    if mode == "ask":
+        answer, answer_meta = await _call_ollama_text(
+            messages=messages,
+            model=model,
+            think=_optional_bool(payload.get("think")),
+            num_ctx=options.get("num_ctx"),
+            num_predict=options.get("num_predict"),
+            temperature=options.get("temperature"),
+            keep_alive=payload.get("keep_alive"),
+        )
+        response = {
+            "answer": answer,
+            "text": answer,
+            "assistant": {
+                **answer_meta,
+                "total_ms": round((time.time() - total_started) * 1000, 3),
+            },
+        }
+        last_result = {
+            "at": time.time(),
+            "external_postedit": True,
+            "mode": "ask",
+            "response": response,
+        }
+        if answer_meta.get("status") != "completed":
+            raise HTTPException(status_code=502, detail=response)
+        return JSONResponse(response)
+
+    schema = payload.get("schema") if isinstance(payload.get("schema"), dict) else EDIT_SCHEMA
     edited_text, editor_notes, edit_meta = await _call_ollama_structured(
         messages=messages,
         model=model,
@@ -461,6 +553,28 @@ async def external_postedit(payload: dict[str, Any] = Body(...)):
     if edit_meta.get("status") != "completed":
         raise HTTPException(status_code=502, detail=response)
     return JSONResponse(response)
+
+
+@app.get("/models")
+async def models():
+    """Expose the Ollama model catalog for client-side model pickers."""
+    try:
+        async with httpx.AsyncClient(timeout=args.ollama_timeout) as client:
+            response = await client.get(f"{args.ollama_url.rstrip('/')}/api/tags")
+        response.raise_for_status()
+        payload = response.json() if response.content else {}
+    except (httpx.HTTPError, ValueError) as exc:
+        raise HTTPException(status_code=502, detail=f"could not query Ollama models: {exc}") from exc
+
+    catalog: list[dict[str, str]] = []
+    for item in payload.get("models", []) if isinstance(payload, dict) else []:
+        if not isinstance(item, dict):
+            continue
+        model_id = str(item.get("model") or item.get("name") or "").strip()
+        if model_id:
+            catalog.append({"id": model_id, "object": "model", "owned_by": "ollama"})
+    catalog.sort(key=lambda item: item["id"])
+    return {"object": "list", "data": catalog}
 
 
 @app.get("/health")

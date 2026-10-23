@@ -14,6 +14,11 @@ diagnostics for inspection.
 
 It also exposes `POST /external_postedit` for clients that already have a
 transcript and want to send a full post-edit prompt directly to the local LLM.
+The same endpoint accepts `"mode": "ask"` for a free-form Voice Ask response,
+so the client can share the external provider URL and authentication/configuration
+between post-editing and Voice Ask.
+`GET /models` translates Ollama's local model catalog into the model-list shape
+used by the desktop client's Voice Ask model picker.
 
 ## Install
 
@@ -117,6 +122,10 @@ OLLAMA_CHAT_THINK=true
 For Qwen3 models, `POST_EDITOR_THINK=false` keeps transcript cleanup closer to a
 fast editing pass instead of a slow reasoning pass.
 
+`POST_EDITOR_NUM_CTX` is the total Ollama context window in tokens, shared by
+the request messages and generated response. A Voice Ask request can override
+it with `ask_external_num_ctx`; leaving that setting blank uses this proxy value.
+
 To bypass cleanup for short utterances:
 
 ```bash
@@ -176,6 +185,22 @@ curl -s -X POST http://127.0.0.1:8010/external_postedit \
     "messages": [
       {"role": "system", "content": "Return JSON with edited_text and editor_notes."},
       {"role": "user", "content": "Clean this transcript: um please fix the bug in the settings thing"}
+    ]
+  }'
+```
+
+Test a free-form Voice Ask request through the same endpoint:
+
+```bash
+curl -s -X POST http://127.0.0.1:8010/external_postedit \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "mode": "ask",
+    "model": "qwen3:1.7b",
+    "think": true,
+    "messages": [
+      {"role": "system", "content": "Answer the dictated request directly."},
+      {"role": "user", "content": "Explain why the sky is blue."}
     ]
   }'
 ```

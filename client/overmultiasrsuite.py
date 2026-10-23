@@ -86,6 +86,7 @@ import soundfile as sf
 CONFIG_FILE = _app_dir() / "config.json"
 DEFAULT_PROMPT_FILE = "post_edit_prompt.md"
 DEFAULT_TRANSCRIPTION_PROMPT_FILE = "transcription_prompt.md"
+DEFAULT_ASK_PROMPT_FILE = "ask_prompt.md"
 POST_EDIT_PROFILES = ("dev", "pro", "personal")
 
 DEFAULT_CONFIG = {
@@ -146,6 +147,15 @@ DEFAULT_CONFIG = {
     "editor_notes_overlay_seconds": 4.0,
     "editor_notes_chars_per_extra_second": 45.0,
     "post_edit_toggle_key": "y",
+    "ask_trigger_key": "",
+    "ask_prompt_markdown_file": DEFAULT_ASK_PROMPT_FILE,
+    "ask_model": "",
+    "ask_reasoning_effort": "",
+    "ask_temperature": None,
+    "ask_max_output_tokens": None,
+    "ask_external_think": True,
+    "ask_external_num_ctx": None,
+    "ask_timeout_seconds": 120.0,
     "post_edit_preview_auto_insert": False,
     "post_edit_review_copy_includes_notes": True,
     "main_review_non_post_edit_sessions": False,
@@ -162,6 +172,15 @@ DEFAULT_CONFIG = {
         "fix obvious grammar, and do not add new facts or requirements."
     ),
     "openai_user_prompt_template": "Transcript:\n{transcript}",
+    "ask_system_prompt": (
+        "You are a helpful assistant answering a request dictated by voice. "
+        "Answer the request directly. Do not merely rewrite or repeat the transcript unless asked."
+    ),
+    "ask_developer_prompt": (
+        "Treat the transcript as the user's question or instruction. Preserve technical terminology that may "
+        "have originated in speech recognition. Use clear formatting when it improves readability."
+    ),
+    "ask_user_prompt_template": "{transcript}",
     "live_mode":   False,  # True = stream chunks live as they arrive (uses screen overlay); False = classic (collect all, type at end)
     "simple_mode": True,   # True = simple ® / ¿ indicators (SSH/terminal safe); False = fancy block-shade/corner-spin animations  (classic mode only)
     "vad_silence_rms":  400,   # RMS below this = silence. Hangover handles noise, so keep this low.
@@ -240,23 +259,32 @@ def load_config() -> dict:
         cfg.setdefault("fast_review_non_post_edit_sessions", legacy_review)
         cfg.pop("review_non_post_edit_sessions", None)
         prompt_sections = _load_prompt_markdown(cfg)
+        ask_prompt_sections = _load_ask_prompt_markdown(cfg)
         cfg["openai_transcription_prompt"] = _load_transcription_prompt_markdown(cfg)
         cfg["openai_system_prompt"] = prompt_sections["system"]
         cfg["openai_developer_prompt"] = prompt_sections["developer"]
         cfg["openai_user_prompt_template"] = prompt_sections["user"]
+        cfg["ask_system_prompt"] = ask_prompt_sections["system"]
+        cfg["ask_developer_prompt"] = ask_prompt_sections["developer"]
+        cfg["ask_user_prompt_template"] = ask_prompt_sections["user"]
         return cfg
     cfg = DEFAULT_CONFIG.copy()
     prompt_sections = _load_prompt_markdown(cfg)
+    ask_prompt_sections = _load_ask_prompt_markdown(cfg)
     cfg["openai_transcription_prompt"] = _load_transcription_prompt_markdown(cfg)
     cfg["openai_system_prompt"] = prompt_sections["system"]
     cfg["openai_developer_prompt"] = prompt_sections["developer"]
     cfg["openai_user_prompt_template"] = prompt_sections["user"]
+    cfg["ask_system_prompt"] = ask_prompt_sections["system"]
+    cfg["ask_developer_prompt"] = ask_prompt_sections["developer"]
+    cfg["ask_user_prompt_template"] = ask_prompt_sections["user"]
     return cfg
 
 
 def save_config(cfg: dict):
     cfg = dict(cfg)
     _save_prompt_markdown(cfg)
+    _save_ask_prompt_markdown(cfg)
     _save_transcription_prompt_markdown(cfg)
     cfg.pop("openai_api_key", None)
     cfg.pop("openai_compatible_post_edit_api_key", None)
@@ -267,6 +295,9 @@ def save_config(cfg: dict):
     cfg.pop("openai_developer_prompt", None)
     cfg.pop("openai_user_prompt_template", None)
     cfg.pop("openai_post_edit_prompt", None)
+    cfg.pop("ask_system_prompt", None)
+    cfg.pop("ask_developer_prompt", None)
+    cfg.pop("ask_user_prompt_template", None)
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
 
@@ -284,7 +315,11 @@ def _set_last_result_text(text: str | None):
 
 def _latest_history_text() -> str:
     return next(
-        ((e.get("text") or "").strip() for e in reversed(list(_history)) if (e.get("text") or "").strip()),
+        (
+            (e.get("text") or "").strip()
+            for e in reversed(list(_history))
+            if e.get("kind") != "ask" and (e.get("text") or "").strip()
+        ),
         "",
     )
 
@@ -330,7 +365,7 @@ def _save_history():
 def _add_to_history(entry: dict):
     """Append a history entry dict and persist. Callers build the dict."""
     text = entry.get("text")
-    if text and not _history_text_is_meaningful(text):
+    if entry.get("kind") != "ask" and text and not _history_text_is_meaningful(text):
         print(f"[HISTORY] Skipping short transcription: {text!r}", flush=True)
         return
     _history.append(entry)
@@ -385,6 +420,13 @@ def _history_status_line(entry: dict) -> str:
     if ts:
         parts.append(ts)
 
+    if entry.get("kind") == "ask":
+        provider = (entry.get("ask_provider") or "").strip()
+        parts.append(f"ASK: {provider or 'provider'}")
+        ask_seconds = _format_history_seconds(entry.get("ask_seconds"))
+        if ask_seconds:
+            parts.append(f"A: {ask_seconds}")
+
     transcription_seconds = _format_history_seconds(entry.get("transcription_seconds"))
     if transcription_seconds:
         parts.append(f"T: {transcription_seconds}")
@@ -393,14 +435,15 @@ def _history_status_line(entry: dict) -> str:
     if transcription_rtf:
         parts.append(f"RTF {transcription_rtf}")
 
-    post_edit_enabled = bool(entry.get("post_edit_enabled", entry.get("post_edit_active", False)))
-    if post_edit_enabled:
-        profile = _post_edit_profile_name(
-            entry.get("post_edit_profile") or entry.get("post_edit_profile_requested")
-        )
-        parts.append(f"PE: {profile or 'on'}")
-    elif "post_edit_enabled" in entry or "post_edit_active" in entry:
-        parts.append("PE: off")
+    if entry.get("kind") != "ask":
+        post_edit_enabled = bool(entry.get("post_edit_enabled", entry.get("post_edit_active", False)))
+        if post_edit_enabled:
+            profile = _post_edit_profile_name(
+                entry.get("post_edit_profile") or entry.get("post_edit_profile_requested")
+            )
+            parts.append(f"PE: {profile or 'on'}")
+        elif "post_edit_enabled" in entry or "post_edit_active" in entry:
+            parts.append("PE: off")
 
     return " | ".join(parts)
 
@@ -444,6 +487,14 @@ def _transcription_prompt_markdown_path(cfg: dict | None = None) -> Path:
     return path
 
 
+def _ask_prompt_markdown_path(cfg: dict | None = None) -> Path:
+    name = (cfg or {}).get("ask_prompt_markdown_file", DEFAULT_ASK_PROMPT_FILE)
+    path = Path(name)
+    if not path.is_absolute():
+        path = _app_dir() / path
+    return path
+
+
 def _prompt_sections_from_config(cfg: dict) -> dict[str, str]:
     return {
         "system": cfg.get("openai_system_prompt", DEFAULT_CONFIG["openai_system_prompt"]),
@@ -452,13 +503,21 @@ def _prompt_sections_from_config(cfg: dict) -> dict[str, str]:
     }
 
 
-def _render_prompt_markdown(sections: dict[str, str]) -> str:
+def _ask_prompt_sections_from_config(cfg: dict) -> dict[str, str]:
+    return {
+        "system": cfg.get("ask_system_prompt", DEFAULT_CONFIG["ask_system_prompt"]),
+        "developer": cfg.get("ask_developer_prompt", DEFAULT_CONFIG["ask_developer_prompt"]),
+        "user": cfg.get("ask_user_prompt_template", DEFAULT_CONFIG["ask_user_prompt_template"]),
+    }
+
+
+def _render_prompt_markdown(sections: dict[str, str], title: str = "Post-Edit Prompt") -> str:
     ordered = [
         ("System", sections.get("system", "").strip()),
         ("Developer", sections.get("developer", "").strip()),
         ("User", sections.get("user", "").strip()),
     ]
-    parts = ["# Post-Edit Prompt"]
+    parts = [f"# {title}"]
     for title, body in ordered:
         parts.append(f"## {title}")
         parts.append(body)
@@ -518,6 +577,35 @@ def _load_prompt_markdown(cfg: dict, profile: str = "dev") -> dict[str, str]:
 def _save_prompt_markdown(cfg: dict, profile: str = "dev", sections: dict[str, str] | None = None):
     path = _prompt_markdown_path(cfg, profile)
     path.write_text(_render_prompt_markdown(sections or _prompt_sections_from_config(cfg)), encoding="utf-8")
+
+
+def _load_ask_prompt_markdown(cfg: dict) -> dict[str, str]:
+    path = _ask_prompt_markdown_path(cfg)
+    if path.exists():
+        try:
+            parsed = _parse_prompt_markdown(path.read_text(encoding="utf-8"))
+            defaults = _ask_prompt_sections_from_config(cfg)
+            return {
+                "system": parsed.get("system") or defaults["system"],
+                "developer": parsed.get("developer") or defaults["developer"],
+                "user": parsed.get("user") or defaults["user"],
+            }
+        except Exception:
+            pass
+    sections = _ask_prompt_sections_from_config(cfg)
+    try:
+        path.write_text(_render_prompt_markdown(sections, "Voice Ask Prompt"), encoding="utf-8")
+    except Exception:
+        pass
+    return sections
+
+
+def _save_ask_prompt_markdown(cfg: dict, sections: dict[str, str] | None = None):
+    path = _ask_prompt_markdown_path(cfg)
+    path.write_text(
+        _render_prompt_markdown(sections or _ask_prompt_sections_from_config(cfg), "Voice Ask Prompt"),
+        encoding="utf-8",
+    )
 
 
 def _load_transcription_prompt_markdown(cfg: dict) -> str:
@@ -1584,6 +1672,8 @@ def _record_with_vad(
     hotkey_name: str = "ptt",
     post_edit_active: bool = False,
     on_post_edit_toggle=None,
+    ask_active: bool = False,
+    on_ask_toggle=None,
     insert_mode: str = "type",
 ):
     """
@@ -1610,12 +1700,13 @@ def _record_with_vad(
     min_speech  = config.get("vad_min_speech_s", _VAD_MIN_SPEECH_S)
     max_chunk_s = config.get("vad_max_chunk_s",  30.0)
     post_edit_active = _post_edit_profile_name(post_edit_active)
+    ask_active = bool(ask_active)
 
     probe = _probe_recording_backend(config)
     if not probe.get("ok"):
         error = probe.get("error") or "Could not open selected input device."
         print(f"[REC] Input device unavailable: {_device_label(device)}: {error}", flush=True)
-        return None, [], None, post_edit_active, None, int(probe.get("native_sr") or target_sr)
+        return None, [], None, post_edit_active, ask_active, None, int(probe.get("native_sr") or target_sr)
 
     native_sr = int(probe.get("native_sr") or target_sr)
     record_method = probe.get("method") or "rec"
@@ -1697,10 +1788,21 @@ def _record_with_vad(
 
     toggle_press_hook = None
     toggle_release_hook = None
+    ask_key_down = False
+    ask_key = (config.get("ask_trigger_key") or "").strip().lower()
+    ask_enabled = bool(on_ask_toggle is not None and ask_key)
+    ask_requested = threading.Event()
+    ask_press_hook = None
+    ask_release_hook = None
 
     if on_post_edit_toggle:
         try:
             on_post_edit_toggle(post_edit_active)
+        except Exception:
+            pass
+    if on_ask_toggle:
+        try:
+            on_ask_toggle(ask_active)
         except Exception:
             pass
 
@@ -1712,7 +1814,7 @@ def _record_with_vad(
                 y_down = keyboard.is_pressed(toggle_key)
             except Exception:
                 y_down = False
-            if y_down and not toggle_y_down:
+            if y_down and not toggle_y_down and not ask_active:
                 post_edit_active = _next_post_edit_profile(post_edit_active)
                 _refresh_silence_samples("post-edit toggle")
                 state_label = post_edit_active.upper() if post_edit_active else "OFF"
@@ -1725,6 +1827,36 @@ def _record_with_vad(
                 except Exception:
                     pass
         toggle_y_down = y_down
+
+    def _handle_ask_trigger():
+        nonlocal ask_active, ask_key_down, post_edit_active
+        key_down = False
+        if ask_enabled:
+            try:
+                key_down = keyboard.is_pressed(ask_key)
+            except Exception:
+                key_down = False
+            requested = ask_requested.is_set() or (key_down and not ask_key_down)
+            if requested and not ask_active:
+                ask_requested.clear()
+                ask_active = True
+                post_edit_active = ""
+                _refresh_silence_samples("Ask branch")
+                print(f"[ASK] Session switched to Voice Ask via {ask_key.upper()}.", flush=True)
+                if on_post_edit_toggle:
+                    try:
+                        on_post_edit_toggle("")
+                    except Exception:
+                        pass
+                try:
+                    on_ask_toggle(True)
+                except Exception:
+                    pass
+        ask_key_down = key_down
+
+    def _handle_session_modifiers():
+        _handle_ask_trigger()
+        _handle_post_edit_toggle()
 
     def _process_vad_block(blk: np.ndarray):
         nonlocal current, spk, chunk_peak, rms_min, rms_max, in_speech, hangover, sil_count
@@ -1793,6 +1925,14 @@ def _record_with_vad(
             except Exception as exc:
                 print(f"[POST] Failed to suppress toggle key {toggle_key.upper()}: {_safe_console_text(exc)}", flush=True)
 
+        if ask_enabled:
+            try:
+                ask_press_hook = keyboard.on_press_key(ask_key, lambda _e: ask_requested.set(), suppress=True)
+                ask_release_hook = keyboard.on_release_key(ask_key, lambda _e: None, suppress=True)
+                print(f"[ASK] Suppressing branch key {ask_key.upper()} while preview dictation is active.", flush=True)
+            except Exception as exc:
+                print(f"[ASK] Failed to suppress branch key {ask_key.upper()}: {_safe_console_text(exc)}", flush=True)
+
         max_record_s = max(1.0, float(max_chunk_s))
         recording = None
         max_record_samples = 0
@@ -1829,7 +1969,7 @@ def _record_with_vad(
                     print(f"[REC] Recording (InputStream at {native_sr} Hz, chunk max {max_record_s:.1f}s)...", flush=True)
                     started_at = time.time()
                     while _hotkey_is_down_now(hotkey_name, config):
-                        _handle_post_edit_toggle()
+                        _handle_session_modifiers()
                         data, _ = stream.read(max(512, int(0.10 * native_sr)))
                         _process_vad_block(data.copy())
                 recording = np.concatenate(all_data) if all_data else np.empty((0, 1), dtype=np.int16)
@@ -1842,7 +1982,7 @@ def _record_with_vad(
         reached_limit = False
         started_at = time.time()
         while recording is not None and len(all_data) == 0 and _hotkey_is_down_now(hotkey_name, config):
-            _handle_post_edit_toggle()
+            _handle_session_modifiers()
 
             if time.time() - started_at >= max_record_s:
                 reached_limit = True
@@ -1880,24 +2020,7 @@ def _record_with_vad(
         if not skip_legacy_chunk_recorder:
             print(f"[REC] Recording (VAD, sd.rec chunks at {native_sr} Hz)...", flush=True)
         while (not skip_legacy_chunk_recorder) and _hotkey_is_down_now(hotkey_name, config):
-                y_down = False
-                if toggle_enabled:
-                    try:
-                        y_down = keyboard.is_pressed(toggle_key)
-                    except Exception:
-                        y_down = False
-                    if y_down and not toggle_y_down:
-                        post_edit_active = _next_post_edit_profile(post_edit_active)
-                        state_label = post_edit_active.upper() if post_edit_active else "OFF"
-                        print(
-                            f"[POST] Session post-edit profile set to {state_label} via {toggle_key.upper()}.",
-                            flush=True,
-                        )
-                        try:
-                            on_post_edit_toggle(post_edit_active)
-                        except Exception:
-                            pass
-                toggle_y_down = y_down
+                _handle_session_modifiers()
 
                 data = sd.rec(
                     rec_chunk_samples,
@@ -1972,9 +2095,9 @@ def _record_with_vad(
                 "Pick a different explicit microphone index in Settings or run --list-mics to compare host APIs.",
                 flush=True,
             )
-        return None, [], None, post_edit_active, None, native_sr
+        return None, [], None, post_edit_active, ask_active, None, native_sr
     finally:
-        for hook in (toggle_press_hook, toggle_release_hook):
+        for hook in (toggle_press_hook, toggle_release_hook, ask_press_hook, ask_release_hook):
             if hook is not None:
                 try:
                     keyboard.unhook(hook)
@@ -1986,11 +2109,11 @@ def _record_with_vad(
 
     if sum(len(block) for block in all_data) < MIN_SAMPLES and not pending:
         print("[REC] Too short, ignoring.", flush=True)
-        return None, [], None, post_edit_active, None, native_sr
+        return None, [], None, post_edit_active, ask_active, None, native_sr
     soft_floor = max(120.0, sil_rms * 0.35)
     if not pending and rms_max < soft_floor:
         print(f"[REC] No meaningful speech detected (max={rms_max:.0f} < soft floor {soft_floor:.0f}), ignoring.", flush=True)
-        return None, [], None, post_edit_active, None, native_sr
+        return None, [], None, post_edit_active, ask_active, None, native_sr
     if not pending and rms_max < sil_rms:
         print(f"[REC] Soft speech stayed below VAD threshold (max={rms_max:.0f} < {sil_rms}) - transcribing anyway.", flush=True)
 
@@ -2004,7 +2127,7 @@ def _record_with_vad(
     if remaining is not None and len(remaining) < int(0.3 * target_sr) and pending:
         remaining = None
 
-    return full_audio, pending, remaining, post_edit_active, raw_full, native_sr
+    return full_audio, pending, remaining, post_edit_active, ask_active, raw_full, native_sr
 
 
 # ── Transcription ─────────────────────────────────────────────────────────────
@@ -2148,6 +2271,36 @@ def _openai_compatible_models_url(chat_url: str) -> str:
     return urllib.parse.urlunsplit((parts.scheme, parts.netloc, path, "", ""))
 
 
+def _external_models_url(post_edit_url: str) -> str:
+    parts = urllib.parse.urlsplit((post_edit_url or "").strip())
+    path = parts.path.rstrip("/")
+    if path.endswith("/external_postedit"):
+        path = path[: -len("/external_postedit")]
+    path = (path or "").rstrip("/") + "/models"
+    return urllib.parse.urlunsplit((parts.scheme, parts.netloc, path, "", ""))
+
+
+def _model_ids_from_catalog(body: dict) -> list[str]:
+    model_ids: list[str] = []
+    for collection_key in ("data", "models"):
+        items = body.get(collection_key, []) if isinstance(body, dict) else []
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            model_id = str(item.get("id") or item.get("model") or item.get("name") or "").strip()
+            if model_id:
+                model_ids.append(model_id)
+    return sorted(dict.fromkeys(model_ids))
+
+
+def _fetch_models_catalog(url: str, headers: dict | None = None, timeout: int = 10) -> list[str]:
+    resp = requests.get(url, headers=headers or {}, timeout=timeout)
+    resp.raise_for_status()
+    return _model_ids_from_catalog(resp.json())
+
+
 def _preferred_openai_compatible_model(models: list[str], current: str) -> str:
     current = (current or "").strip()
     if current and current != DEFAULT_CONFIG["openai_compatible_post_edit_model"] and current in models:
@@ -2165,15 +2318,19 @@ def _preferred_openai_compatible_model(models: list[str], current: str) -> str:
 
 
 def _fetch_openai_compatible_models(url: str, headers: dict | None = None, timeout: int = 10) -> list[str]:
-    resp = requests.get(_openai_compatible_models_url(url), headers=headers or {}, timeout=timeout)
-    resp.raise_for_status()
-    body = resp.json()
-    models = [
-        str(item.get("id") or "").strip()
-        for item in body.get("data", [])
-        if isinstance(item, dict) and str(item.get("id") or "").strip()
-    ]
-    return sorted(dict.fromkeys(models))
+    return _fetch_models_catalog(_openai_compatible_models_url(url), headers=headers, timeout=timeout)
+
+
+def _fetch_openai_models(api_key: str, timeout: int = 10) -> list[str]:
+    return _fetch_models_catalog(
+        "https://api.openai.com/v1/models",
+        headers={"Authorization": f"Bearer {api_key}"},
+        timeout=timeout,
+    )
+
+
+def _fetch_external_models(url: str, timeout: int = 10) -> list[str]:
+    return _fetch_models_catalog(_external_models_url(url), timeout=timeout)
 
 
 def _post_edit_provider_model_key(provider: str) -> str:
@@ -2214,7 +2371,12 @@ def _openai_compatible_post_edit_model(config: dict, edit_profile: str) -> str:
     return _post_edit_model_for_provider(config, "openai_compatible", edit_profile)
 
 
-def _openai_compatible_chat_messages(messages: list[dict], config: dict) -> list[dict]:
+def _openai_compatible_chat_messages(
+    messages: list[dict],
+    config: dict,
+    *,
+    require_post_edit_json: bool = True,
+) -> list[dict]:
     developer_role = (
         config.get("openai_compatible_post_edit_developer_role")
         or DEFAULT_CONFIG["openai_compatible_post_edit_developer_role"]
@@ -2222,10 +2384,12 @@ def _openai_compatible_chat_messages(messages: list[dict], config: dict) -> list
     if developer_role not in {"system", "user", "developer"}:
         developer_role = "system"
 
-    system_parts: list[str] = [(
-        "Output contract: return only a JSON object with string keys "
-        "`edited_text` and `editor_notes`. Do not wrap it in markdown."
-    )]
+    system_parts: list[str] = []
+    if require_post_edit_json:
+        system_parts.append(
+            "Output contract: return only a JSON object with string keys "
+            "`edited_text` and `editor_notes`. Do not wrap it in markdown."
+        )
     chat_messages: list[dict] = []
     for message in messages:
         content = str(message.get("content") or "").strip()
@@ -2521,6 +2685,258 @@ def _post_edit_text(text: str, config: dict, profile: str, edit_profile: str = "
     if provider == "openai_compatible":
         return _post_edit_text_openai_compatible(text, config, profile, edit_profile, messages, prompts)
     return _post_edit_text_openai(text, config, profile, edit_profile, messages, prompts)
+
+
+def _render_ask_messages(text: str, config: dict) -> list[dict]:
+    sections = _load_ask_prompt_markdown(config)
+    values = {"transcript": text}
+    messages: list[dict] = []
+    for role, key in (("system", "system"), ("developer", "developer"), ("user", "user")):
+        content = sections.get(key) or ""
+        for placeholder, value in values.items():
+            content = content.replace(f"{{{placeholder}}}", value)
+        if content.strip():
+            messages.append({"role": role, "content": content})
+    return messages
+
+
+def _ask_model_for_provider(config: dict, provider: str) -> str:
+    provider = _normalize_post_edit_provider(provider)
+    provider_key = _post_edit_provider_model_key(provider)
+    return (
+        config.get("ask_model")
+        or config.get(provider_key)
+        or DEFAULT_CONFIG.get(provider_key, "")
+    ).strip()
+
+
+def _ask_timeout(config: dict) -> float:
+    try:
+        return max(5.0, float(config.get("ask_timeout_seconds", DEFAULT_CONFIG["ask_timeout_seconds"])))
+    except Exception:
+        return float(DEFAULT_CONFIG["ask_timeout_seconds"])
+
+
+def _ask_temperature(config: dict) -> float | None:
+    value = config.get("ask_temperature")
+    if value in {None, ""}:
+        value = config.get(
+            "openai_compatible_post_edit_temperature",
+            DEFAULT_CONFIG["openai_compatible_post_edit_temperature"],
+        )
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def _ask_max_output_tokens(config: dict) -> int | None:
+    value = config.get("ask_max_output_tokens")
+    if value in {None, ""}:
+        return None
+    try:
+        return max(1, int(value))
+    except Exception:
+        return None
+
+
+def _openai_response_text(body: dict) -> str:
+    direct = body.get("output_text")
+    if isinstance(direct, str) and direct.strip():
+        return direct.strip()
+    parts: list[str] = []
+    for item in body.get("output", []):
+        if not isinstance(item, dict):
+            continue
+        for content in item.get("content", []):
+            if not isinstance(content, dict):
+                continue
+            if content.get("type") in {"output_text", "text"} and content.get("text"):
+                parts.append(str(content["text"]))
+    return "\n".join(part.strip() for part in parts if part.strip()).strip()
+
+
+def _ask_text_openai(
+    text: str,
+    config: dict,
+    messages: list[dict],
+) -> tuple[str, str, bool, str]:
+    api_key = _openai_api_key()
+    model = _ask_model_for_provider(config, "openai")
+    if not api_key:
+        return "", "OPENAI_API_KEY is not set.", False, model
+    if not model or not messages:
+        return "", "Ask model or prompt is missing.", False, model
+
+    payload: dict = {
+        "model": model,
+        "input": _openai_input_from_messages(messages),
+    }
+    reasoning_effort = (
+        config.get("ask_reasoning_effort")
+        or config.get("openai_reasoning_effort")
+        or ""
+    ).strip().lower()
+    if reasoning_effort:
+        payload["reasoning"] = {"effort": reasoning_effort}
+    max_output_tokens = _ask_max_output_tokens(config)
+    if max_output_tokens is not None:
+        payload["max_output_tokens"] = max_output_tokens
+
+    print(f"[ASK] Sending transcript to configured OpenAI provider via {model}.", flush=True)
+    try:
+        resp = requests.post(
+            "https://api.openai.com/v1/responses",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=_ask_timeout(config),
+        )
+        print(f"[ASK] OpenAI HTTP {resp.status_code}", flush=True)
+        resp.raise_for_status()
+        answer = _openai_response_text(resp.json())
+        if not answer:
+            return "", "The provider returned an empty answer.", False, model
+        return answer, "", True, model
+    except Exception as exc:
+        error = _safe_console_text(exc)
+        print(f"[ASK] OpenAI request failed: {error}", flush=True)
+        return "", error, False, model
+
+
+def _ask_text_openai_compatible(
+    text: str,
+    config: dict,
+    messages: list[dict],
+) -> tuple[str, str, bool, str]:
+    url = (
+        config.get("openai_compatible_post_edit_url")
+        or DEFAULT_CONFIG["openai_compatible_post_edit_url"]
+    ).strip()
+    model = _ask_model_for_provider(config, "openai_compatible")
+    headers = {"Content-Type": "application/json"}
+    api_key = _openai_compatible_api_key(config)
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    if not url or not messages:
+        return "", "The configured compatible provider URL or Ask prompt is missing.", False, model
+
+    if not model:
+        try:
+            models = _fetch_openai_compatible_models(url, headers=headers, timeout=10)
+            model = _preferred_openai_compatible_model(models, model)
+        except Exception as exc:
+            return "", f"Could not select a compatible model: {_safe_console_text(exc)}", False, model
+    if not model:
+        return "", "No compatible model is configured or available.", False, model
+
+    payload: dict = {
+        "model": model,
+        "messages": _openai_compatible_chat_messages(
+            messages,
+            config,
+            require_post_edit_json=False,
+        ),
+    }
+    temperature = _ask_temperature(config)
+    if temperature is not None:
+        payload["temperature"] = temperature
+    reasoning_effort = (config.get("ask_reasoning_effort") or "").strip().lower()
+    if reasoning_effort:
+        payload["reasoning_effort"] = reasoning_effort
+    max_output_tokens = _ask_max_output_tokens(config)
+    if max_output_tokens is not None:
+        payload["max_tokens"] = max_output_tokens
+
+    print(f"[ASK] Sending transcript to configured compatible provider via {url} ({model}).", flush=True)
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=_ask_timeout(config))
+        if resp.status_code in {400, 404, 422} and any(
+            key in payload for key in ("temperature", "reasoning_effort", "max_tokens")
+        ):
+            print("[ASK] Compatible provider rejected optional parameters; retrying with model/messages only.", flush=True)
+            resp = requests.post(
+                url,
+                headers=headers,
+                json={"model": model, "messages": payload["messages"]},
+                timeout=_ask_timeout(config),
+            )
+        print(f"[ASK] Compatible HTTP {resp.status_code}", flush=True)
+        resp.raise_for_status()
+        body = resp.json()
+        choices = body.get("choices") or []
+        message = choices[0].get("message", {}) if choices and isinstance(choices[0], dict) else {}
+        answer = str(message.get("content") or body.get("text") or "").strip()
+        answer = re.sub(r"(?is)<think>.*?</think>", "", answer).strip()
+        if not answer:
+            return "", "The provider returned an empty answer.", False, model
+        return answer, "", True, model
+    except Exception as exc:
+        error = _safe_console_text(exc)
+        print(f"[ASK] Compatible request failed: {error}", flush=True)
+        return "", error, False, model
+
+
+def _ask_text_external(
+    text: str,
+    config: dict,
+    messages: list[dict],
+) -> tuple[str, str, bool, str]:
+    url = (config.get("external_post_edit_url") or DEFAULT_CONFIG["external_post_edit_url"]).strip()
+    model = _ask_model_for_provider(config, "external")
+    if not url or not model or not messages:
+        return "", "The configured external provider URL, model, or Ask prompt is missing.", False, model
+
+    options: dict = {}
+    temperature = _ask_temperature(config)
+    if temperature is not None:
+        options["temperature"] = temperature
+    max_output_tokens = _ask_max_output_tokens(config)
+    if max_output_tokens is not None:
+        options["num_predict"] = max_output_tokens
+    num_ctx = config.get("ask_external_num_ctx")
+    if num_ctx not in {None, ""}:
+        try:
+            options["num_ctx"] = max(1, int(num_ctx))
+        except Exception:
+            pass
+    payload = {
+        "mode": "ask",
+        "model": model,
+        "transcript": text,
+        "messages": messages,
+        "think": bool(config.get("ask_external_think", DEFAULT_CONFIG["ask_external_think"])),
+        "reasoning_effort": (config.get("ask_reasoning_effort") or "").strip().lower(),
+        "options": options,
+    }
+    print(f"[ASK] Sending transcript to configured external provider via {url} ({model}).", flush=True)
+    try:
+        resp = requests.post(url, json=payload, timeout=_ask_timeout(config))
+        print(f"[ASK] External HTTP {resp.status_code}", flush=True)
+        resp.raise_for_status()
+        body = resp.json()
+        answer = str(body.get("answer") or body.get("text") or "").strip()
+        if not answer:
+            return "", "The provider returned an empty answer.", False, model
+        return answer, "", True, model
+    except Exception as exc:
+        error = _safe_console_text(exc)
+        print(f"[ASK] External request failed: {error}", flush=True)
+        return "", error, False, model
+
+
+def _ask_text(text: str, config: dict) -> tuple[str, str, bool, str, str]:
+    messages = _render_ask_messages(text, config)
+    provider = _normalize_post_edit_provider(config.get("post_edit_provider"))
+    if provider == "external":
+        answer, error, success, model = _ask_text_external(text, config, messages)
+    elif provider == "openai_compatible":
+        answer, error, success, model = _ask_text_openai_compatible(text, config, messages)
+    else:
+        answer, error, success, model = _ask_text_openai(text, config, messages)
+    return answer, error, success, provider, model
 
 
 def _post_wav_bytes(wav_bytes: bytes, config: dict) -> tuple[str | None, str | None]:
@@ -2858,9 +3274,14 @@ _preview_overlay_state = {
     "status": "",
     "profile": "main",
     "post_edit": False,
+    "ask": False,
     "loading": False,
+    "dismissible": False,
+    "request_id": 0,
 }
 _preview_overlay_started = [False]
+_ask_request_counter = [0]
+_dismissed_ask_requests: set[int] = set()
 _draft_tap_lock = threading.Lock()
 _draft_tap_state = {
     "stamp": 0.0,
@@ -2936,8 +3357,22 @@ def _apply_noactivate(hwnd: int):
         pass
 
 
-def _set_preview_overlay(*, visible: bool, text: str = "", editor_notes: str = "", status: str = "", profile: str = "main", post_edit: bool = False, loading: bool = False):
+def _set_preview_overlay(
+    *,
+    visible: bool,
+    text: str = "",
+    editor_notes: str = "",
+    status: str = "",
+    profile: str = "main",
+    post_edit: bool = False,
+    ask: bool = False,
+    loading: bool = False,
+    dismissible: bool = False,
+    request_id: int = 0,
+):
     with _preview_overlay_lock:
+        if request_id and request_id in _dismissed_ask_requests:
+            return
         _preview_overlay_state.update({
             "visible": bool(visible),
             "text": text,
@@ -2945,11 +3380,25 @@ def _set_preview_overlay(*, visible: bool, text: str = "", editor_notes: str = "
             "status": status,
             "profile": profile,
             "post_edit": post_edit,
+            "ask": bool(ask),
             "loading": bool(loading),
+            "dismissible": bool(dismissible),
+            "request_id": int(request_id or 0),
         })
 
 
-def _show_preview_overlay(text: str, status: str, profile: str, post_edit: bool = False, loading: bool = False, editor_notes: str = ""):
+def _show_preview_overlay(
+    text: str,
+    status: str,
+    profile: str,
+    post_edit: bool = False,
+    loading: bool = False,
+    editor_notes: str = "",
+    *,
+    ask: bool = False,
+    dismissible: bool = False,
+    request_id: int = 0,
+):
     _ensure_preview_overlay()
     _set_preview_overlay(
         visible=True,
@@ -2958,12 +3407,42 @@ def _show_preview_overlay(text: str, status: str, profile: str, post_edit: bool 
         status=status,
         profile=profile,
         post_edit=post_edit,
+        ask=ask,
         loading=loading,
+        dismissible=dismissible,
+        request_id=request_id,
     )
 
 
 def _hide_preview_overlay():
     _set_preview_overlay(visible=False)
+
+
+def _next_ask_request_id() -> int:
+    with _preview_overlay_lock:
+        _ask_request_counter[0] += 1
+        return _ask_request_counter[0]
+
+
+def _dismiss_ask_preview():
+    with _preview_overlay_lock:
+        if not (_preview_overlay_state.get("ask") and _preview_overlay_state.get("dismissible")):
+            return
+        request_id = int(_preview_overlay_state.get("request_id") or 0)
+        if request_id:
+            _dismissed_ask_requests.add(request_id)
+        _preview_overlay_state["visible"] = False
+        _preview_overlay_state["dismissible"] = False
+    print("[ASK] Preview dismissed.", flush=True)
+
+
+def _ask_preview_is_blocking() -> bool:
+    with _preview_overlay_lock:
+        return bool(
+            _preview_overlay_state.get("visible")
+            and _preview_overlay_state.get("ask")
+            and _preview_overlay_state.get("dismissible")
+        )
 
 
 def _set_pending_draft(text: str, profile: str, post_edit: bool | str, editor_notes: str = "", post_edit_failed: bool = False):
@@ -3239,7 +3718,6 @@ def _preview_overlay_main():
     header.pack(fill="x", padx=12, pady=(10, 6))
     title_var = tk.StringVar(value="Dictation")
     status_var = tk.StringVar(value="")
-    body_var = tk.StringVar(value="")
     notes_var = tk.StringVar(value="")
     badge_var = tk.StringVar(value="")
     spinner_frames = ["|", "/", "-", "\\"]
@@ -3248,17 +3726,34 @@ def _preview_overlay_main():
     tk.Label(header, textvariable=title_var, bg="#0f172a", fg="#e2e8f0", font=("Segoe UI", 12, "bold")).pack(side="left")
     tk.Label(header, textvariable=badge_var, bg="#0f172a", fg="#93c5fd", font=("Segoe UI", 10, "bold")).pack(side="right")
     tk.Label(frame, textvariable=status_var, bg="#0f172a", fg="#cbd5e1", justify="left", anchor="w", wraplength=520, font=("Segoe UI", 10)).pack(fill="x", padx=12)
-    body_label = tk.Label(
-        frame,
-        textvariable=body_var,
+    body_frame = tk.Frame(frame, bg="#0f172a")
+    body_frame.pack(fill="both", expand=True, padx=12, pady=(8, 12))
+    body_text = tk.Text(
+        body_frame,
         bg="#0f172a",
         fg="#f8fafc",
-        justify="left",
-        anchor="nw",
-        wraplength=520,
+        insertbackground="#f8fafc",
+        wrap="word",
         font=("Segoe UI", 13),
+        relief="flat",
+        borderwidth=0,
+        highlightthickness=0,
+        cursor="arrow",
+        state="disabled",
+        width=60,
+        height=4,
     )
-    body_label.pack(fill="both", expand=True, padx=12, pady=(8, 12))
+    body_scroll = tk.Scrollbar(body_frame, orient="vertical", command=body_text.yview)
+    body_text.configure(yscrollcommand=body_scroll.set)
+    body_text.pack(side="left", fill="both", expand=True)
+    body_scroll.pack(side="right", fill="y", padx=(6, 0))
+    shown_body = [None]
+
+    def _scroll_body(event):
+        body_text.yview_scroll(-1 if event.delta > 0 else 1, "units")
+        return "break"
+
+    body_text.bind("<MouseWheel>", _scroll_body)
     notes_title = tk.Label(frame, text="Editor notes", bg="#0f172a", fg="#bfdbfe", justify="left", anchor="w", font=("Segoe UI", 10, "bold"))
     notes_body = tk.Label(
         frame,
@@ -3314,14 +3809,18 @@ def _preview_overlay_main():
     tk.Button(review_btns, text="Close", command=_close_review, width=10).pack(side="left")
     review.protocol("WM_DELETE_WINDOW", _close_review)
 
-    def _position_preview(width: int, height: int):
+    def _position_preview(width: int, height: int, *, stable: bool = False):
         # Use Tk's pointer coordinates for Tk geometry. Mixing Win32 physical
         # cursor coordinates with Tk-scaled window coordinates drifts badly on
         # mixed-DPI monitor setups.
-        try:
-            x, y = preview.winfo_pointerxy()
-        except Exception:
-            x, y = _cursor_pos()
+        if stable and preview.winfo_viewable():
+            x = preview.winfo_x() - 24
+            y = preview.winfo_y() - 24
+        else:
+            try:
+                x, y = preview.winfo_pointerxy()
+            except Exception:
+                x, y = _cursor_pos()
 
         try:
             work_left = preview.winfo_vrootx()
@@ -3337,6 +3836,8 @@ def _preview_overlay_main():
         offset_x = 24
         offset_y = 24
         margin = 8
+        width = min(width, max(220, work_right - work_left - (margin * 2)))
+        height = min(height, max(160, work_bottom - work_top - (margin * 2)))
 
         px = x + offset_x
         py = y + offset_y
@@ -3392,13 +3893,21 @@ def _preview_overlay_main():
         if st.get("visible") and not review_open:
             profile = st.get("profile") or "main"
             post_edit_profile = _post_edit_profile_name(st.get("post_edit"))
-            title_var.set("Fast Dictation" if profile == "fast" else "Dictation")
-            badge_var.set(f"EDIT {post_edit_profile.upper()}" if post_edit_profile else "EDIT OFF")
+            ask_active = bool(st.get("ask"))
+            title_var.set("Voice Ask" if ask_active else "Fast Dictation" if profile == "fast" else "Dictation")
+            badge_var.set("ASK" if ask_active else f"EDIT {post_edit_profile.upper()}" if post_edit_profile else "EDIT OFF")
             status = st.get("status") or ""
             if st.get("loading"):
                 status = f"{status} {spinner_frames[tick[0] % len(spinner_frames)]}".strip()
             status_var.set(status)
-            body_var.set(st.get("text") or "Listening...")
+            body_value = st.get("text") or "Listening..."
+            if shown_body[0] != body_value:
+                shown_body[0] = body_value
+                body_text.configure(state="normal")
+                body_text.delete("1.0", "end")
+                body_text.insert("1.0", body_value)
+                body_text.configure(state="disabled")
+                body_text.yview_moveto(0.0)
             notes_value = (st.get("editor_notes") or "").strip()
             notes_var.set(notes_value)
             if notes_value:
@@ -3409,17 +3918,32 @@ def _preview_overlay_main():
                 if notes_title.winfo_ismapped():
                     notes_title.pack_forget()
                     notes_body.pack_forget()
-            body_label.configure(wraplength=560)
+            average_char_width = 9
+            max_body_chars = max(50, int((max_preview_width - 70) / average_char_width))
+            longest_line = max((len(line) for line in body_value.splitlines()), default=0)
+            body_chars = min(max_body_chars, max(50, min(90, longest_line or 50)))
+            estimated_lines = 0
+            for logical_line in body_value.splitlines() or [""]:
+                estimated_lines += max(1, (len(logical_line) + body_chars - 1) // body_chars)
+            max_body_lines = max(4, int((max_preview_height - 125) / 24))
+            body_text.configure(width=body_chars, height=min(max_body_lines, max(4, estimated_lines)))
             preview.update_idletasks()
             width = max(500, min(max_preview_width, frame.winfo_reqwidth() + 4))
             height = max(220, min(max_preview_height, frame.winfo_reqheight() + 4))
-            _position_preview(width, height)
+            _position_preview(width, height, stable=bool(ask_active and st.get("dismissible")))
             if not preview.winfo_viewable():
                 preview.deiconify()
                 preview.lift()
         elif preview.winfo_viewable():
             preview.withdraw()
         root.after(50, _poll)
+
+    def _on_preview_click(event):
+        if event.widget is body_scroll:
+            return
+        _dismiss_ask_preview()
+
+    preview.bind("<Button-1>", _on_preview_click, add="+")
 
     root.after(0, lambda: _apply_noactivate(preview.winfo_id()))
     root.after(50, _poll)
@@ -3741,6 +4265,7 @@ def run_session(
     profile: str = "main",
     hotkey_name: str = "ptt",
     on_post_edit_change=None,
+    on_ask_change=None,
 ):
     """Full push-to-talk cycle: record → transcribe → type.  Runs in a thread."""
     if not _session_lock.acquire(blocking=False):
@@ -3814,8 +4339,12 @@ def run_session(
         preview_text = [""]
         preview_status = ["Listening"]
         preview_post_edit = [post_edit_active]
+        preview_ask = [False]
+        ask_request_id = [0]
 
         def _apply_post_edit_state(enabled):
+            if preview_ask[0]:
+                return
             preview_post_edit[0] = _post_edit_profile_name(enabled)
             if on_post_edit_change:
                 try:
@@ -3828,10 +4357,40 @@ def run_session(
                 status=preview_status[0],
                 profile=profile,
                 post_edit=preview_post_edit[0],
+                ask=preview_ask[0],
                 loading=False,
+                request_id=ask_request_id[0],
             )
 
-        def _set_preview(status: str | None = None, text: str | None = None, *, loading: bool = False):
+        def _apply_ask_state(enabled):
+            preview_ask[0] = bool(enabled)
+            if preview_ask[0]:
+                preview_post_edit[0] = ""
+                if not ask_request_id[0]:
+                    ask_request_id[0] = _next_ask_request_id()
+            if on_ask_change:
+                try:
+                    on_ask_change(preview_ask[0])
+                except Exception:
+                    pass
+            _show_preview_overlay(
+                text=preview_text[0],
+                editor_notes="",
+                status="Voice Ask selected" if preview_ask[0] else preview_status[0],
+                profile=profile,
+                post_edit="",
+                ask=preview_ask[0],
+                loading=False,
+                request_id=ask_request_id[0],
+            )
+
+        def _set_preview(
+            status: str | None = None,
+            text: str | None = None,
+            *,
+            loading: bool = False,
+            dismissible: bool = False,
+        ):
             if status is not None:
                 preview_status[0] = status
             if text is not None:
@@ -3842,7 +4401,10 @@ def run_session(
                 status=preview_status[0],
                 profile=profile,
                 post_edit=preview_post_edit[0],
+                ask=preview_ask[0],
                 loading=loading,
+                dismissible=dismissible,
+                request_id=ask_request_id[0],
             )
 
         _apply_post_edit_state(post_edit_active)
@@ -3863,12 +4425,14 @@ def run_session(
                     ordered = [chunk_results[i] for i in sorted(chunk_results)]
                 _set_preview(text=_join_chunks(ordered))
 
-            full_audio, pending, remaining, post_edit_active, raw_full_audio, native_sr = _record_with_vad(
+            full_audio, pending, remaining, post_edit_active, ask_active, raw_full_audio, native_sr = _record_with_vad(
                 config,
                 on_chunk_ready=_on_classic_chunk,
                 hotkey_name=hotkey_name,
                 post_edit_active=post_edit_active,
                 on_post_edit_toggle=_apply_post_edit_state,
+                ask_active=False,
+                on_ask_toggle=(_apply_ask_state if profile == "main" else None),
                 insert_mode=insert_mode,
             )
 
@@ -3928,6 +4492,68 @@ def run_session(
 
             if result:
                 _set_preview(text=result)
+            if ask_active:
+                if not preview_ask[0]:
+                    _apply_ask_state(True)
+                if result:
+                    _set_preview("Thinking", result, loading=True, dismissible=True)
+                    ask_started = time.perf_counter()
+                    answer, ask_error, ask_success, ask_provider, ask_model = _ask_text(result, config)
+                    ask_seconds = time.perf_counter() - ask_started
+                    if ask_success:
+                        _set_preview(
+                            "Answer ready - click to close",
+                            answer,
+                            loading=False,
+                            dismissible=True,
+                        )
+                        print(f"[ASK] Answer ready ({len(answer)} chars).", flush=True)
+                    else:
+                        failure_text = f"Request:\n{result}\n\nAsk failed:\n{ask_error or 'Unknown provider error.'}"
+                        _set_preview(
+                            "Ask failed - click to close",
+                            failure_text,
+                            loading=False,
+                            dismissible=True,
+                        )
+                    _add_to_history({
+                        "time": _now_str(),
+                        "kind": "ask",
+                        "source_transcript": result,
+                        "text": answer if ask_success else None,
+                        "error": ask_error if not ask_success else None,
+                        "audio_seconds": round(audio_seconds, 3) if audio_seconds is not None else None,
+                        "transcription_seconds": round(transcription_seconds, 3),
+                        "transcription_rtf": round(_rtf(transcription_seconds, audio_seconds), 4) if _rtf(transcription_seconds, audio_seconds) is not None else None,
+                        "ask_seconds": round(ask_seconds, 3),
+                        "ask_success": bool(ask_success),
+                        "ask_provider": ask_provider,
+                        "ask_model": ask_model,
+                        "post_edit_enabled": False,
+                        "post_edit_active": False,
+                    })
+                else:
+                    ask_error = error or "Transcription returned no usable text."
+                    _set_preview(
+                        "Ask failed - click to close",
+                        ask_error,
+                        loading=False,
+                        dismissible=True,
+                    )
+                    _add_to_history({
+                        "time": _now_str(),
+                        "kind": "ask",
+                        "source_transcript": "",
+                        "text": None,
+                        "error": ask_error,
+                        "audio_seconds": round(audio_seconds, 3) if audio_seconds is not None else None,
+                        "transcription_seconds": round(transcription_seconds, 3),
+                        "ask_success": False,
+                        "post_edit_enabled": False,
+                        "post_edit_active": False,
+                    })
+                return
+
             if result and post_edit_active and not live_cfg:
                 _set_preview("Post-editing", result, loading=True)
                 post_edit_started = time.perf_counter()
@@ -4063,7 +4689,7 @@ def run_session(
             else:
                 print("[STATUS] Listening", flush=True)
 
-            full_audio, pending, remaining, post_edit_active, raw_full_audio, native_sr = _record_with_vad(
+            full_audio, pending, remaining, post_edit_active, _, raw_full_audio, native_sr = _record_with_vad(
                 config,
                 hotkey_name=hotkey_name,
                 post_edit_active=post_edit_active,
@@ -4263,7 +4889,7 @@ def run_session(
             _set_overlay(_OVL_RECORDING)
             print("[STATUS] Listening (live)", flush=True)
 
-            full_audio, pending, remaining, _, raw_full_audio, native_sr = _record_with_vad(
+            full_audio, pending, remaining, _, _, raw_full_audio, native_sr = _record_with_vad(
                 config,
                 on_chunk_ready=_on_chunk_during_hold,
                 hotkey_name=hotkey_name,
@@ -4456,6 +5082,20 @@ def validate_hotkey(hotkey: str) -> tuple[bool, str]:
     return True, f"OK — {hotkey}"
 
 
+def validate_session_trigger_key(key_name: str) -> tuple[bool, str]:
+    value = (key_name or "").strip().lower()
+    if not value:
+        return True, "disabled"
+    if "+" in value:
+        return False, "Use one key, not a key combination."
+    try:
+        if not keyboard.key_to_scan_codes(value):
+            return False, "Unknown key."
+    except Exception as exc:
+        return False, f"Unknown key: {_safe_console_text(exc)}"
+    return True, "valid"
+
+
 def open_settings(config: dict, on_save_callback):
     """Open a Tkinter settings dialog. Runs in its own thread."""
     import tkinter as tk
@@ -4479,12 +5119,14 @@ def open_settings(config: dict, on_save_callback):
     S  = tk.Frame(nb, padx=10, pady=8)   # Advanced tab
     TRANS = tk.Frame(nb, padx=10, pady=8) # Transcription AI tab
     POST = tk.Frame(nb, padx=10, pady=8)  # Post-edit tab
+    ASK = tk.Frame(nb, padx=10, pady=8)   # Voice Ask tab
     MT = tk.Frame(nb, padx=10, pady=8)   # Microphone Test tab
     IC = tk.Frame(nb, padx=10, pady=8)   # Input Classes tab
     nb.add(MIC, text="  Microphone  ")
     nb.add(S,  text="  Advanced  ")
     nb.add(TRANS, text="  Transcription AI  ")
     nb.add(POST, text="  Post-Edit  ")
+    nb.add(ASK, text="  Voice Ask  ")
     nb.add(MT, text="  Microphone Test  ")
     nb.add(IC, text="  Input Classes  ")
 
@@ -5341,6 +5983,209 @@ def open_settings(config: dict, on_save_callback):
     _configure_model_controls()
 
     # ════════════════════════════════════════════════════════════════════════
+    # Voice Ask tab. Provider selection and connection/auth settings are inherited
+    # from Post-Edit; this tab only controls the in-session branch and request.
+    ASK.columnconfigure(1, weight=1)
+    tk.Label(
+        ASK,
+        text=(
+            "During normal preview dictation, press the branch key once while the main hotkey is held. "
+            "The transcript is sent to the configured Post-Edit provider and the answer stays in the preview until clicked."
+        ),
+        fg="grey",
+        justify="left",
+        wraplength=620,
+    ).grid(row=0, column=0, columnspan=3, sticky="w", padx=8, pady=(4, 10))
+
+    tk.Label(ASK, text="Branch key:").grid(row=1, column=0, sticky="e", **pad)
+    ask_trigger_key_var = tk.StringVar(master=win, value=config.get("ask_trigger_key", ""))
+    ask_key_frame = tk.Frame(ASK)
+    ask_key_frame.grid(row=1, column=1, columnspan=2, sticky="w", **pad)
+    tk.Entry(ask_key_frame, textvariable=ask_trigger_key_var, width=18).pack(side="left")
+    ask_key_status = tk.Label(ask_key_frame, text="", width=24, anchor="w")
+    ask_key_status.pack(side="left", padx=(8, 0))
+    ask_capture_active = [False]
+
+    def _validate_ask_key(*_):
+        ok, message = validate_session_trigger_key(ask_trigger_key_var.get())
+        color = "#16a34a" if ok and ask_trigger_key_var.get().strip() else "grey" if ok else "#dc2626"
+        ask_key_status.configure(text=message, fg=color)
+
+    def _capture_ask_key():
+        if ask_capture_active[0]:
+            return
+        ask_capture_active[0] = True
+        ask_capture_btn.configure(state="disabled")
+        ask_key_status.configure(text="Press one key...", fg="grey")
+
+        def _do():
+            try:
+                key_name = keyboard.read_key(suppress=False)
+                win.after(0, lambda: ask_trigger_key_var.set(key_name))
+            except Exception as exc:
+                win.after(0, lambda: ask_key_status.configure(text=f"Capture failed: {exc}", fg="#dc2626"))
+            finally:
+                ask_capture_active[0] = False
+                win.after(0, lambda: ask_capture_btn.configure(state="normal"))
+
+        threading.Thread(target=_do, daemon=True).start()
+
+    ask_capture_btn = tk.Button(ask_key_frame, text="Capture...", command=_capture_ask_key)
+    ask_capture_btn.pack(side="left", padx=(6, 0))
+    ask_trigger_key_var.trace_add("write", _validate_ask_key)
+    _validate_ask_key()
+
+    tk.Label(ASK, text="Provider:").grid(row=2, column=0, sticky="e", **pad)
+    ask_provider_display_var = tk.StringVar(master=win, value=_normalize_post_edit_provider(post_edit_provider_var.get()))
+    tk.Label(ASK, textvariable=ask_provider_display_var, anchor="w").grid(row=2, column=1, sticky="w", **pad)
+    tk.Label(ASK, text="inherited from Post-Edit", fg="grey").grid(row=2, column=2, sticky="w", **pad)
+
+    tk.Label(ASK, text="Model override:").grid(row=3, column=0, sticky="e", **pad)
+    ask_model_var = tk.StringVar(master=win, value=config.get("ask_model", ""))
+    ask_model_frame = tk.Frame(ASK)
+    ask_model_frame.grid(row=3, column=1, sticky="ew", **pad)
+    ask_model_combo = ttk.Combobox(
+        ask_model_frame,
+        textvariable=ask_model_var,
+        values=(),
+        width=34,
+        state="normal",
+    )
+    ask_model_combo.pack(side="left")
+    ask_model_query_btn = tk.Button(ask_model_frame, text="Query", width=8)
+    ask_model_query_btn.pack(side="left", padx=(6, 0))
+    ask_model_status_var = tk.StringVar(master=win, value="query provider models")
+    tk.Label(ask_model_frame, textvariable=ask_model_status_var, fg="grey", anchor="w").pack(
+        side="left", padx=(8, 0)
+    )
+    tk.Label(ASK, text="blank = provider's base post-edit model", fg="grey").grid(row=3, column=2, sticky="w", **pad)
+
+    ask_model_options = {provider: [] for provider in post_edit_providers}
+
+    def _configure_ask_model_control(provider: str):
+        models = ask_model_options.get(provider, [])
+        ask_model_combo.configure(values=("", *models))
+        ask_model_status_var.set(f"{len(models)} models" if models else "query provider models")
+
+    def _query_ask_models():
+        provider = _normalize_post_edit_provider(post_edit_provider_var.get())
+        hosted_api_key = _openai_api_key()
+        compatible_url = openai_compatible_post_edit_url_var.get().strip()
+        compatible_api_key = _openai_compatible_api_key(config)
+        external_url = external_post_edit_url_var.get().strip()
+        ask_model_status_var.set("loading models...")
+        ask_model_query_btn.config(state="disabled")
+
+        def _load():
+            try:
+                if provider == "openai":
+                    if not hosted_api_key:
+                        raise RuntimeError("OPENAI_API_KEY is not set")
+                    models = _fetch_openai_models(hosted_api_key, timeout=10)
+                elif provider == "openai_compatible":
+                    if not compatible_url:
+                        raise RuntimeError("compatible provider URL is not set")
+                    headers = {}
+                    if compatible_api_key:
+                        headers["Authorization"] = f"Bearer {compatible_api_key}"
+                    models = _fetch_openai_compatible_models(compatible_url, headers=headers, timeout=10)
+                else:
+                    if not external_url:
+                        raise RuntimeError("external provider URL is not set")
+                    models = _fetch_external_models(external_url, timeout=10)
+                if not models:
+                    raise RuntimeError("no models returned")
+
+                def _apply():
+                    ask_model_options[provider] = models
+                    if _normalize_post_edit_provider(post_edit_provider_var.get()) == provider:
+                        _configure_ask_model_control(provider)
+                    ask_model_query_btn.config(state="normal")
+
+                win.after(0, _apply)
+            except Exception as exc:
+                error_text = _safe_console_text(exc)
+
+                def _fail():
+                    if _normalize_post_edit_provider(post_edit_provider_var.get()) == provider:
+                        ask_model_status_var.set(f"model query failed: {error_text}")
+                    ask_model_query_btn.config(state="normal")
+
+                win.after(0, _fail)
+
+        threading.Thread(target=_load, daemon=True).start()
+
+    def _sync_ask_provider(*_):
+        provider = _normalize_post_edit_provider(post_edit_provider_var.get())
+        ask_provider_display_var.set(provider)
+        _configure_ask_model_control(provider)
+
+    ask_model_query_btn.config(command=_query_ask_models)
+    post_edit_provider_var.trace_add("write", _sync_ask_provider)
+    _configure_ask_model_control(_normalize_post_edit_provider(post_edit_provider_var.get()))
+
+    tk.Label(ASK, text="Reasoning effort:").grid(row=4, column=0, sticky="e", **pad)
+    ask_reasoning_var = tk.StringVar(master=win, value=config.get("ask_reasoning_effort", ""))
+    ttk.Combobox(
+        ASK,
+        textvariable=ask_reasoning_var,
+        values=("", "minimal", "low", "medium", "high", "xhigh"),
+        width=16,
+        state="normal",
+    ).grid(row=4, column=1, sticky="w", **pad)
+    tk.Label(ASK, text="blank = inherit Post-Edit reasoning", fg="grey").grid(row=4, column=2, sticky="w", **pad)
+
+    ask_temperature_value = config.get("ask_temperature")
+    ask_temperature_var = tk.StringVar(master=win, value="" if ask_temperature_value is None else str(ask_temperature_value))
+    tk.Label(ASK, text="Temperature:").grid(row=5, column=0, sticky="e", **pad)
+    tk.Entry(ASK, textvariable=ask_temperature_var, width=10).grid(row=5, column=1, sticky="w", **pad)
+    tk.Label(ASK, text="blank = compat/external inherit; hosted omits", fg="grey").grid(row=5, column=2, sticky="w", **pad)
+
+    ask_max_tokens_value = config.get("ask_max_output_tokens")
+    ask_max_tokens_var = tk.StringVar(master=win, value="" if ask_max_tokens_value is None else str(ask_max_tokens_value))
+    tk.Label(ASK, text="Max output tokens:").grid(row=6, column=0, sticky="e", **pad)
+    tk.Entry(ASK, textvariable=ask_max_tokens_var, width=10).grid(row=6, column=1, sticky="w", **pad)
+    tk.Label(ASK, text="blank = provider default", fg="grey").grid(row=6, column=2, sticky="w", **pad)
+
+    tk.Label(ASK, text="Timeout seconds:").grid(row=7, column=0, sticky="e", **pad)
+    ask_timeout_var = tk.StringVar(master=win, value=str(config.get("ask_timeout_seconds", DEFAULT_CONFIG["ask_timeout_seconds"])))
+    tk.Entry(ASK, textvariable=ask_timeout_var, width=10).grid(row=7, column=1, sticky="w", **pad)
+
+    ask_external_think_var = tk.BooleanVar(master=win, value=bool(config.get("ask_external_think", DEFAULT_CONFIG["ask_external_think"])))
+    tk.Checkbutton(
+        ASK,
+        text="Enable thinking for the external provider (when supported)",
+        variable=ask_external_think_var,
+        anchor="w",
+    ).grid(row=8, column=1, columnspan=2, sticky="w", **pad)
+
+    ask_num_ctx_value = config.get("ask_external_num_ctx")
+    ask_num_ctx_var = tk.StringVar(master=win, value="" if ask_num_ctx_value is None else str(ask_num_ctx_value))
+    tk.Label(ASK, text="External context size:").grid(row=9, column=0, sticky="e", **pad)
+    tk.Entry(ASK, textvariable=ask_num_ctx_var, width=10).grid(row=9, column=1, sticky="w", **pad)
+    tk.Label(ASK, text="blank = proxy default (4096 unless changed)", fg="grey").grid(row=9, column=2, sticky="w", **pad)
+
+    tk.Label(ASK, text="Prompt file:").grid(row=10, column=0, sticky="ne", **pad)
+    tk.Label(
+        ASK,
+        text=str(_ask_prompt_markdown_path(config)),
+        anchor="w",
+        justify="left",
+        wraplength=520,
+        fg="grey",
+    ).grid(row=10, column=1, columnspan=2, sticky="w", **pad)
+
+    ask_prompt_sections = _load_ask_prompt_markdown(config)
+    tk.Label(ASK, text="System prompt:").grid(row=11, column=0, sticky="ne", **pad)
+    ask_system_prompt_text = _make_scrolled_text(ASK, row=11, height=3)
+    ask_system_prompt_text.insert("1.0", ask_prompt_sections["system"])
+    tk.Label(ASK, text="Developer prompt:").grid(row=12, column=0, sticky="ne", **pad)
+    ask_developer_prompt_text = _make_scrolled_text(ASK, row=12, height=4)
+    ask_developer_prompt_text.insert("1.0", ask_prompt_sections["developer"])
+    tk.Label(ASK, text="User prompt template:").grid(row=13, column=0, sticky="ne", **pad)
+    ask_user_prompt_text = _make_scrolled_text(ASK, row=13, height=4)
+    ask_user_prompt_text.insert("1.0", ask_prompt_sections["user"])
+
     # Microphone Test tab
     # ════════════════════════════════════════════════════════════════════════
     MT.columnconfigure(0, weight=1)
@@ -5860,6 +6705,19 @@ def open_settings(config: dict, on_save_callback):
         if len({c.lower() for c in combos}) != len(combos):
             messagebox.showerror("Duplicate Hotkeys", "Hotkey, fast hotkey, and last-result hotkey must be different.")
             return
+        ask_trigger_key = ask_trigger_key_var.get().strip().lower()
+        ok, msg = validate_session_trigger_key(ask_trigger_key)
+        if not ok:
+            messagebox.showerror("Invalid Voice Ask Key", msg)
+            return
+        post_edit_toggle_key = post_edit_toggle_key_var.get().strip().lower() or DEFAULT_CONFIG["post_edit_toggle_key"]
+        if ask_trigger_key and ask_trigger_key == post_edit_toggle_key:
+            messagebox.showerror("Conflicting Session Keys", "Voice Ask and the post-edit toggle must use different keys.")
+            return
+        normal_hotkey_parts = {part.strip().lower() for part in hotkey.split("+") if part.strip()}
+        if ask_trigger_key and ask_trigger_key in normal_hotkey_parts:
+            messagebox.showerror("Conflicting Voice Ask Key", "The Voice Ask key cannot already be part of the normal hotkey.")
+            return
         try:
             new_cfg["vad_silence_rms"]  = float(vad_rms_var.get())
             new_cfg["vad_silence_secs"] = float(vad_secs_var.get())
@@ -5939,9 +6797,42 @@ def open_settings(config: dict, on_save_callback):
             new_cfg["editor_notes_chars_per_extra_second"] = max(1.0, float(editor_notes_scale_var.get().strip() or DEFAULT_CONFIG["editor_notes_chars_per_extra_second"]))
         except Exception:
             new_cfg["editor_notes_chars_per_extra_second"] = DEFAULT_CONFIG["editor_notes_chars_per_extra_second"]
-        new_cfg["post_edit_toggle_key"] = post_edit_toggle_key_var.get().strip().lower() or DEFAULT_CONFIG["post_edit_toggle_key"]
+        new_cfg["post_edit_toggle_key"] = post_edit_toggle_key
         new_cfg["post_edit_preview_auto_insert"] = bool(post_edit_auto_insert_var.get())
         new_cfg["post_edit_review_copy_includes_notes"] = bool(review_copy_include_notes_var.get())
+        new_cfg["ask_trigger_key"] = ask_trigger_key
+        new_cfg["ask_model"] = ask_model_var.get().strip()
+        new_cfg["ask_reasoning_effort"] = ask_reasoning_var.get().strip().lower()
+        try:
+            new_cfg["ask_temperature"] = (
+                None if not ask_temperature_var.get().strip() else float(ask_temperature_var.get().strip())
+            )
+            new_cfg["ask_max_output_tokens"] = (
+                None if not ask_max_tokens_var.get().strip() else max(1, int(ask_max_tokens_var.get().strip()))
+            )
+            new_cfg["ask_timeout_seconds"] = max(5.0, float(ask_timeout_var.get().strip()))
+            new_cfg["ask_external_num_ctx"] = (
+                None if not ask_num_ctx_var.get().strip() else max(1, int(ask_num_ctx_var.get().strip()))
+            )
+        except ValueError:
+            messagebox.showerror(
+                "Invalid Voice Ask Value",
+                "Temperature and timeout must be numbers; token and external context limits must be whole numbers.",
+            )
+            return
+        new_cfg["ask_external_think"] = bool(ask_external_think_var.get())
+        ask_sections = {
+            "system": ask_system_prompt_text.get("1.0", "end").strip(),
+            "developer": ask_developer_prompt_text.get("1.0", "end").strip(),
+            "user": ask_user_prompt_text.get("1.0", "end").strip(),
+        }
+        if ask_trigger_key and "{transcript}" not in "\n".join(ask_sections.values()):
+            messagebox.showerror("Invalid Voice Ask Prompt", "The Voice Ask prompt must contain {transcript}.")
+            return
+        new_cfg["ask_system_prompt"] = ask_sections["system"]
+        new_cfg["ask_developer_prompt"] = ask_sections["developer"]
+        new_cfg["ask_user_prompt_template"] = ask_sections["user"]
+        _save_ask_prompt_markdown(new_cfg, ask_sections)
         _store_active_prompt_profile()
         for prompt_profile, prompt_sections in prompt_sections_by_profile.items():
             _save_prompt_markdown(new_cfg, prompt_profile, prompt_sections)
@@ -6167,6 +7058,9 @@ def run_tray(config_holder: list[dict]):
     # Never touch pystray icon handles here — Win32 DestroyIcon crashes across threads.
     # Icon updates happen inside _session (a plain daemon thread) instead.
     def _on_hotkey(hotkey_name: str, insert_mode: str, profile: str):
+        if _ask_preview_is_blocking():
+            print("[ASK] Answer preview is still open; click it before starting another dictation.", flush=True)
+            return
         pending_draft = _peek_pending_draft()
         if pending_draft:
             tap_deadline = time.time() + _DRAFT_TAP_RELEASE_MAX
@@ -6231,6 +7125,11 @@ def run_tray(config_holder: list[dict]):
             tray_icon.icon = _make_icon(active_icon, badge_text=(edit_profile[:1].upper() if edit_profile else None))
             tray_icon.title = f"OverMultiASRSuite ({label}...)"
 
+        def _update_ask_icon(enabled):
+            if enabled:
+                tray_icon.icon = _make_icon(active_icon, badge_text="?")
+                tray_icon.title = "OverMultiASRSuite (voice ask...)"
+
         try:
             _update_active_icon(False)
             tray_icon.title = f"OverMultiASRSuite ({active_label}…)"
@@ -6240,6 +7139,7 @@ def run_tray(config_holder: list[dict]):
                 profile=profile,
                 hotkey_name=hotkey_name,
                 on_post_edit_change=_update_active_icon,
+                on_ask_change=_update_ask_icon,
             )
         finally:
             _release_possible_modifiers()

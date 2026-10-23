@@ -84,7 +84,7 @@ echo Distribute these files together:
 echo   OverMultiASRSuite.exe
 echo   HotkeyHelper.exe
 echo   config.json ^(optional starter/local settings^)
-echo   *_post_edit_prompt.md / transcription_prompt.md ^(optional local prompt files^)
+echo   *_post_edit_prompt.md / transcription_prompt.md / ask_prompt.md ^(optional local prompt files^)
 echo.
 echo NOTE: The exe requests UAC elevation on launch (needed for global hotkeys).
 echo       history.json and overmultiasrsuite.log are created next to the exe on first run.

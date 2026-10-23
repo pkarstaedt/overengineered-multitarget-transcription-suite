@@ -26,6 +26,7 @@ client/history.json
 client/overmultiasrsuite.log
 client/post_edit_prompt.md
 client/transcription_prompt.md
+client/ask_prompt.md
 client/*_post_edit_prompt.md
 .env
 .env.*

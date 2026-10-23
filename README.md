@@ -16,6 +16,8 @@ There are also intentionally two hotkey families:
 
 This split exists because there is no single Windows text-insertion method that works well everywhere. The main hotkey optimizes for compatibility; the fast hotkey optimizes for speed.
 
+Normal preview mode also has an optional **Voice Ask** branch. While holding the normal dictation hotkey, press the configured Ask key once. The session is latched into Ask mode: the completed transcript is sent to the same provider configured for post-editing, the provider's answer replaces the transcript in the preview, and nothing is inserted into the focused application. The answer remains visible until the preview is clicked.
+
 ---
 
 ## How it works
@@ -298,6 +300,7 @@ HotkeyHelper.exe
 config.json
 *_post_edit_prompt.md
 transcription_prompt.md
+ask_prompt.md
 ```
 
 `history.json` and `overmultiasrsuite.log` are created automatically next to the exe on first run.
@@ -367,12 +370,13 @@ Each file contains three editable sections:
 
 The Settings dialog still lets you edit these fields, but saving writes them back to Markdown files instead of storing large escaped multiline strings in `config.json`. The repository keeps `.example` versions only; your real profile prompts are ignored by git.
 
-There are four prompt Markdown files in normal use:
+There are five prompt Markdown files in normal use when Voice Ask is enabled:
 
 - `client/transcription_prompt.md`
 - `client/dev_post_edit_prompt.md`
 - `client/pro_post_edit_prompt.md`
 - `client/personal_post_edit_prompt.md`
+- `client/ask_prompt.md` when Voice Ask is enabled
 
 Put any project vocabulary, repo guardrails, terminology corrections, or prompting preferences directly into the relevant post-edit profile prompt.
 
@@ -402,6 +406,14 @@ while the post-edit prompt can stay focused on stronger restructuring and coding
 | `transcription_backend` | `http` | `http` uses the configured `/transcribe` endpoint. `whispercpp` uses a whisper.cpp `/inference` endpoint. `openai` sends WAV audio directly to OpenAI speech-to-text. |
 | `openai_transcription_model` | `gpt-4o-mini-transcribe` | OpenAI speech-to-text model used when `transcription_backend` is `openai`. |
 | `post_edit_provider` | `openai` | Post-edit backend. `openai` calls the OpenAI Responses API. `openai_compatible` calls a local Chat Completions-compatible server. `external` sends the rendered profile prompt to `external_post_edit_url`. |
+| `ask_trigger_key` | `""` | Optional single key pressed while the normal preview hotkey is held to latch the current session into Voice Ask. Empty disables the branch. |
+| `ask_model` | `""` | Optional Voice Ask model override. Empty inherits the selected provider's base post-edit model. The Voice Ask tab can query the inherited provider and populate its editable model picker. |
+| `ask_reasoning_effort` | `""` | Optional reasoning override. Hosted OpenAI inherits `openai_reasoning_effort` when blank; compatible/external providers receive the override when set and may ignore it. |
+| `ask_temperature` | `null` | Optional request temperature override for compatible/external providers. `null` inherits `openai_compatible_post_edit_temperature` (default `0.0`); hosted OpenAI receives no temperature field. |
+| `ask_max_output_tokens` | `null` | Optional Voice Ask response limit. `null` omits the request field, leaving the provider default unchanged. |
+| `ask_external_think` | `true` | Enables thinking on the bundled external Ollama provider for Voice Ask requests. |
+| `ask_external_num_ctx` | `null` | Optional Ollama total context-window override in tokens. It covers the input prompt/transcript plus generated context; `null` uses the proxy's `POST_EDITOR_NUM_CTX` (default `4096`). It is separate from the output-token limit. |
+| `ask_timeout_seconds` | `120.0` | Voice Ask provider request timeout. |
 | `external_post_edit_url` | `http://127.0.0.1:8010/external_postedit` | Local/proxy post-edit endpoint used when `post_edit_provider` is `external`. |
 | `openai_compatible_post_edit_url` | `http://127.0.0.1:1234/v1/chat/completions` | Local OpenAI-compatible Chat Completions endpoint used when `post_edit_provider` is `openai_compatible`. |
 | `openai_compatible_post_edit_model` | `""` | Model name sent to the local OpenAI-compatible post-edit server. The Post-Edit tab can fetch `/v1/models` and fill this from the compatible endpoint. |
@@ -507,6 +519,16 @@ Right-click the tray icon and choose **Settings...**. The window has tabs for mi
 - **Toggle key** - key pressed during dictation to cycle post-edit profiles: `off -> dev -> pro -> personal -> off`.
 - **Profile prompts** - shows the resolved paths for the three local profile prompt files.
 - **System / Developer / User prompt editors** - edit and save prompt sections as Markdown instead of embedding long strings in `config.json`.
+
+### Voice Ask tab
+
+- **Branch key** - a single key pressed once during a normal preview recording. It is suppressed from the focused application and latches Ask mode until the main hotkey is released.
+- **Provider** - read-only display of the provider selected in Post-Edit. Voice Ask does not maintain a second provider configuration.
+- **Model / reasoning / temperature / token limit / timeout** - optional request-level overrides; blank fields inherit the provider's post-edit defaults.
+- **External thinking / context size** - request controls used by the bundled external Ollama provider.
+- **System / Developer / User prompt editors** - the independent Ask prompt stored in `ask_prompt.md`; the prompt must contain `{transcript}`.
+
+Voice Ask is available only for the normal hotkey in `preview` mode. It is intentionally not a third push-to-talk profile and does not alter the fast, classic, or live paths. Once selected, Ask takes precedence over any post-edit profile chosen earlier in the same recording. Its answer is stored in history but never becomes the last insertable transcription.
 
 ### Microphone Test tab
 
@@ -928,6 +950,8 @@ client/
   *_post_edit_prompt.md Local profile prompts (auto-created/local-only)
   transcription_prompt.md.example Public transcription prompt template
   transcription_prompt.md Local transcription prompt (auto-created/local-only)
+  ask_prompt.md.example  Public Voice Ask prompt template
+  ask_prompt.md          Local Voice Ask prompt (auto-created/local-only)
   history.json          Transcription history (auto-created)
   overmultiasrsuite.log    Log file when running as exe (auto-created)
   failed_audio/         WAV recordings of failed transcriptions, for retry (auto-created)
